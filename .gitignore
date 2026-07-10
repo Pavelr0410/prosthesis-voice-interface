@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Vosk models
+model-ru/
+model-ru-small/
+vosk-model-ru-0.22/
+vosk-model-ru-0.42/
+*.zip
+*.tar.gz
+
+# Test audio files
+test_audio/
+*.wav
