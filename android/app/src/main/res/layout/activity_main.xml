@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp"
+    android:background="#FF0A0A0F">
+
+    <!-- Состояние -->
+    <TextView
+        android:id="@+id/stateLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:text="@string/state_loading"
+        android:textColor="#FFCCCCFF"
+        android:textSize="20sp"
+        android:fontFamily="monospace"
+        android:padding="4dp" />
+
+    <!-- Partial (live) -->
+    <TextView
+        android:id="@+id/partialLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:text=""
+        android:textColor="#FF6080CC"
+        android:textSize="14sp"
+        android:fontFamily="monospace"
+        android:padding="2dp" />
+
+    <!-- Ответ -->
+    <TextView
+        android:id="@+id/responseLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:text=""
+        android:textColor="#FF44FF44"
+        android:textSize="22sp"
+        android:fontFamily="monospace"
+        android:padding="4dp"
+        android:layout_marginBottom="8dp" />
+
+    <!-- Разделитель -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="#FF222233"
+        android:layout_marginBottom="4dp" />
+
+    <!-- Лог (70% высоты) -->
+    <ScrollView
+        android:id="@+id/logScroll"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true">
+
+        <TextView
+            android:id="@+id/logText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="top|start"
+            android:text=""
+            android:textColor="#FF999999"
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:padding="8dp" />
+    </ScrollView>
+
+</LinearLayout>
