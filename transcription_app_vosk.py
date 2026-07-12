@@ -1,17 +1,18 @@
 """
 transcription_app_vosk.py
 ==========================
-Real-time распознавание голосовых команд через VOSK (constrained grammar).
+Real-time распознавание голосовых команд через VOSK.
 
-В отличие от faster-whisper версии, VOSK — стриминговый движок:
-каждый чанк аудио обрабатывается инкрементально через AcceptWaveform().
-Нет батчевой транскрипции, нет задержки на накопление буфера.
+Двухрежимная архитектура:
+  - Wake word detection: свободное распознавание — детектит "протез"
+  - Command capture: свободное распознавание + fuzzy match против grammar.json
+    (constrained grammar через HCLG.fst невозможен на small-ru-0.22 —
+     доменные слова отсутствуют в словаре модели)
 
 Архитектура:
-  - 2 фоновых потока: audio capture, VOSK worker (без отдельного model loading)
+  - 2 фоновых потока: audio capture, VOSK worker
   - Основной поток Kivy — GUI
   - Внешний VAD (webrtcvad) управляет пайплайном
-  - VOSK с partial results — можно получать промежуточный текст
 """
 
 import os
@@ -23,6 +24,7 @@ import collections
 import queue
 from enum import Enum, auto
 from datetime import datetime
+from difflib import SequenceMatcher
 
 import numpy as np
 import pyaudio
@@ -35,6 +37,7 @@ from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.widget import Widget
 from kivy.clock import Clock
+from kivy.graphics import Color, Rectangle
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -46,14 +49,16 @@ END_WORD       = "выполнять"
 END_SYNONYMS   = {END_WORD, "выполняй", "выполняйте", "выполни", "поехали", "давай", "старт"}
 PACKET_TIMEOUT = 5.0
 LOG_DIR        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs_vosk")
-CHUNK_DURATION = 0.4
+CHUNK_DURATION = 1.0
 SAMPLE_RATE    = 16000
 CHUNK_SIZE     = 1024
 MODEL_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model-ru")
+GRAMMAR_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grammar.json")
 
 VAD_AGGRESSIVE = 3
 VAD_FRAME_MS   = 30
 SILENCE_SEC    = 0.8
+MATCH_THRESHOLD = 0.85
 
 GESTURES = {
     "нейтральный", "нейтраль",
@@ -119,6 +124,11 @@ class VoskVoiceApp(App):
     def build(self):
         self.state = State.LOADING
         self.model = None
+        try:
+            self.grammar_str = json.dumps(json.load(open(GRAMMAR_PATH, encoding="utf-8")))
+        except Exception as e:
+            print(f"Grammar load error: {e}")
+            self.grammar_str = "[]"
 
         self.audio = pyaudio.PyAudio()
         self.audio_buffer = collections.deque()
@@ -139,45 +149,62 @@ class VoskVoiceApp(App):
         threading.Thread(target=self._audio_capture, daemon=True).start()
         threading.Thread(target=self._vosk_worker, daemon=True).start()
 
-        self.main = BoxLayout(orientation='vertical', spacing=8, padding=15)
+        # ── Корневой layout ──
+        self.main = BoxLayout(orientation='vertical', spacing=4, padding=10)
 
-        # ── Состояние ──
+        # ── Верхняя панель (фиксированная) ──
+        top_panel = BoxLayout(orientation='vertical', spacing=2, size_hint=(1, None))
+        top_panel.height = 80
+
         self.state_label = Label(
             text='[ЗАГРУЗКА VOSK...]',
-            font_size='22sp', halign='center', valign='middle',
-            color=(0.8, 0.8, 1, 1))
+            font_size='20sp', halign='center', valign='middle',
+            color=(0.8, 0.8, 1, 1), size_hint=(1, None), height=30)
         self.state_label.bind(size=self.state_label.setter('text_size'))
-        self.main.add_widget(self.state_label)
+        top_panel.add_widget(self.state_label)
 
-        # ── Частичный результат (live) ──
         self.partial_label = Label(
-            text='', font_size='16sp', halign='center', valign='middle',
-            color=(0.5, 0.7, 0.9, 1))
+            text='', font_size='14sp', halign='center', valign='middle',
+            color=(0.5, 0.7, 0.9, 1), size_hint=(1, None), height=24)
         self.partial_label.bind(size=self.partial_label.setter('text_size'))
-        self.main.add_widget(self.partial_label)
+        top_panel.add_widget(self.partial_label)
 
-        # ── Ответ ──
         self.response_label = Label(
-            text='', font_size='26sp', halign='center', valign='middle',
-            color=(0.3, 1, 0.3, 1))
+            text='', font_size='22sp', halign='center', valign='middle',
+            color=(0.3, 1, 0.3, 1), size_hint=(1, None), height=28)
         self.response_label.bind(size=self.response_label.setter('text_size'))
-        self.main.add_widget(self.response_label)
+        top_panel.add_widget(self.response_label)
 
-        self.main.add_widget(Widget(size_hint=(1, 0.02)))
+        self.main.add_widget(top_panel)
 
-        # ── Лог ──
-        scroll = ScrollView(size_hint=(1, 0.60))
+        # ── Нижняя панель: draggable консоль ──
+        self._log_scroll = ScrollView(
+            size_hint=(1, 0.75), bar_width=8,
+            scroll_type=['bars', 'content'])
+        with self._log_scroll.canvas.before:
+            Color(0.08, 0.08, 0.1, 1)
+            self._log_bg = Rectangle(size=self._log_scroll.size, pos=self._log_scroll.pos)
+        self._log_scroll.bind(size=self._update_log_bg, pos=self._update_log_bg)
+
         self.log_label = Label(
-            text='', font_size='13sp', halign='left', valign='top',
-            color=(0.6, 0.6, 0.6, 1), size_hint_y=None)
+            text='', font_size='12sp', halign='left', valign='top',
+            color=(0.6, 0.6, 0.6, 1), size_hint_y=None,
+            padding=(8, 4))
         self.log_label.bind(width=lambda *x: setattr(
             self.log_label, 'text_size', (self.log_label.width, None)))
         self.log_label.bind(texture_size=self.log_label.setter('size'))
-        scroll.add_widget(self.log_label)
-        self.main.add_widget(scroll)
+        self._log_scroll.add_widget(self.log_label)
+
+        self.main.add_widget(self._log_scroll)
+
+        self._log(f"Грамматика: {len(json.loads(self.grammar_str))} фраз | Модель: {MODEL_PATH}")
 
         Clock.schedule_interval(self._update_gui, 0.10)
         return self.main
+
+    def _update_log_bg(self, *args):
+        self._log_bg.size = self._log_scroll.size
+        self._log_bg.pos = self._log_scroll.pos
 
     # ── Загрузка модели ─────────────────────────────────────────
     def _load_model(self):
@@ -235,7 +262,7 @@ class VoskVoiceApp(App):
         if not has_speech(audio):
             return
 
-        text = self._vosk_transcribe_incremental(audio)
+        text = self._vosk_transcribe_freeform(audio)
         if not text:
             return
 
@@ -258,8 +285,9 @@ class VoskVoiceApp(App):
             self.state = State.PROCESSING
             self.result_queue.put(("process", chunk_audio))
 
-    # ── VOSK инкрементальная транскрипция ────────────────────────
-    def _vosk_transcribe_incremental(self, audio: np.ndarray) -> str:
+    # ── VOSK: свободное распознавание (wake word) ────────────────
+    def _vosk_transcribe_freeform(self, audio: np.ndarray) -> str:
+        """Без грамматики — для детекции ключевого слова."""
         if len(audio) < SAMPLE_RATE * 0.15:
             return ""
         try:
@@ -275,34 +303,39 @@ class VoskVoiceApp(App):
             self._log(f"VOSK error: {e}")
             return ""
 
-    def _vosk_transcribe_streaming(self, audio: np.ndarray) -> str:
-        """Стриминговая транскрипция с partial results (не сбрасывает декодер)."""
-        if len(audio) < SAMPLE_RATE * 0.15:
-            return ""
-        try:
-            rec = vosk.KaldiRecognizer(self.model, SAMPLE_RATE)
-            rec.SetWords(True)
-
-            audio_int16 = (audio * 32768.0).astype(np.int16)
-
-            chunk_samples = int(SAMPLE_RATE * 0.5)
-            for i in range(0, len(audio_int16), chunk_samples):
-                chunk = audio_int16[i:i + chunk_samples]
-                rec.AcceptWaveform(chunk.tobytes())
-                partial = json.loads(rec.PartialResult())
-                text = partial.get("partial", "").strip()
-                if text:
-                    self.result_queue.put(("partial", text))
-
-            result = json.loads(rec.FinalResult())
-            return result.get("text", "").strip()
-        except Exception as e:
-            self._log(f"VOSK streaming error: {e}")
-            return ""
-
-    # ── Транскрипция захваченного пакета (с partial results) ────
+    # ── VOSK: свободное + fuzzy match против grammar.json ────────
     def _vosk_transcribe_packet(self, audio: np.ndarray) -> str:
-        return self._vosk_transcribe_streaming(audio)
+        """Свободная транскрипция + поиск лучшего совпадения в grammar.json."""
+        raw = self._vosk_transcribe_freeform(audio)
+        if not raw:
+            return ""
+
+        self._log(f"[RAW] {raw}")
+
+        grammar_list = json.loads(self.grammar_str)
+        if not grammar_list:
+            return raw
+
+        best_match, best_score = None, 0.0
+        raw_lower = raw.lower().strip()
+        for phrase in grammar_list:
+            score = SequenceMatcher(None, raw_lower, phrase.lower()).ratio()
+            if score > best_score:
+                best_score = score
+                best_match = phrase
+
+        if best_match and best_score >= MATCH_THRESHOLD:
+            self._log(f"[MATCH] {best_score:.1%} → '{best_match}'")
+            # Отправляем каждый шаг матчинга как partial для GUI
+            words = best_match.split()
+            for i in range(1, len(words) + 1):
+                partial_text = " ".join(words[:i])
+                self.result_queue.put(("partial", partial_text))
+                time.sleep(0.02)
+            return best_match
+        else:
+            self._log(f"[MATCH] {best_score:.1%} — below threshold, raw='{raw}'")
+            return raw
 
     # ── Конвертер ────────────────────────────────────────────────
     @staticmethod
@@ -422,9 +455,10 @@ class VoskVoiceApp(App):
     def _append_log(self, msg: str):
         timestamp = time.strftime("%H:%M:%S")
         self.log_lines.append(f"[{timestamp}] {msg}")
-        if len(self.log_lines) > 100:
-            self.log_lines = self.log_lines[-100:]
+        if len(self.log_lines) > 200:
+            self.log_lines = self.log_lines[-200:]
         self.log_label.text = "\n".join(self.log_lines)
+        self._log_scroll.scroll_y = 0
 
     # ── Завершение ───────────────────────────────────────────────
     def on_stop(self):
