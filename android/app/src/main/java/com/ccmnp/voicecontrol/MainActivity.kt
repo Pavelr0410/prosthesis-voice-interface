@@ -102,7 +102,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         logText = findViewById(R.id.logText)
         logScroll = findViewById(R.id.logScroll)
 
-        storageService.start()
+        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), PERMISSION_RECORD)
     }
 
     // ── Разрешения ────────────────────────────────────────────
