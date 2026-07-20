@@ -28,9 +28,13 @@ android {
         jvmTarget = "17"
     }
 
+    androidResources {
+        noCompress += "model-ru"
+    }
+
     sourceSets {
         getByName("main") {
-            assets.srcDirs("src/main/assets")
+            assets.srcDirs("src/main/assets/model-ru")
         }
     }
 }

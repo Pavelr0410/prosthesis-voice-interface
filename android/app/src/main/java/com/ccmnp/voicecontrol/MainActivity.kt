@@ -25,8 +25,10 @@ import org.vosk.android.RecognitionListener
 import org.vosk.android.SpeechService
 import org.vosk.android.StorageService
 import java.io.IOException
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.zip.ZipInputStream
 import kotlin.math.max
 
 /* ================================================================
@@ -46,7 +48,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         private const val TAG = "VoiceControl"
         private const val SAMPLE_RATE = 16000f
         private const val PERMISSION_RECORD = 1001
-        private const val PACKET_TIMEOUT = 5000L      // макс. длительность захвата
+        private const val PACKET_TIMEOUT = 5000L      // макс. длительность захвата (8s)
         private const val MATCH_THRESHOLD = 0.85      // порог fuzzy match (верифицирован 2026-07-20: Clean 74%, FP 2.5%)
         private const val KEYWORD = "протез"
     }
@@ -59,6 +61,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     private var speechService: SpeechService? = null
     private var captureStart = 0L
     private val capturedText = StringBuilder()
+    private var lastPartial = ""
     private val grammarList = mutableListOf<String>()
     private val whitelistWords = mutableSetOf<String>()
 
@@ -120,20 +123,56 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         }
     }
 
-    // ── Модель: скачивание + загрузка ─────────────────────────
+    // ── Модель: загрузка вручную ───────────────────────────────
     private fun initModel() {
         state = State.LOADING
         updateStateUI()
 
-        StorageService.unpack(this, "model-ru", "model",
-            { model ->
-                this.model = model
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val modelDir = File(filesDir, "model-ru")
+                val confFile = File(modelDir, "conf/model.conf")
+
+                // Already extracted?
+                if (!confFile.exists()) {
+                    log("[INFO] Extracting model-ru.zip...")
+                    modelDir.deleteRecursively()
+                    modelDir.mkdirs()
+
+                    val zipBytes = assets.open("model-ru.zip").use { it.readBytes() }
+                    ZipInputStream(zipBytes.inputStream()).use { zis ->
+                        var entry = zis.nextEntry
+                        while (entry != null) {
+                            // Strip "model-ru/" prefix from ZIP entries
+                            var entryName = entry.name
+                            if (entryName.startsWith("model-ru/")) {
+                                entryName = entryName.substringAfter("model-ru/")
+                            }
+                            val outFile = File(modelDir, entryName)
+                            if (entry.isDirectory) {
+                                outFile.mkdirs()
+                            } else {
+                                outFile.parentFile?.mkdirs()
+                                outFile.outputStream().use { zis.copyTo(it) }
+                            }
+                            zis.closeEntry()
+                            entry = zis.nextEntry
+                        }
+                    }
+                    val fileCount = modelDir.walkTopDown().count { it.isFile }
+                    log("[INFO] Model extracted: $fileCount files")
+                }
+
+                val m = Model(modelDir.absolutePath)
+                model = m
                 loadGrammar()
                 log("[INFO] VOSK загружен")
-                startListening()
-            },
-            { e -> log("[ERROR] Model load failed: $e") }
-        )
+                withContext(Dispatchers.Main) { startListening() }
+            } catch (e: Exception) {
+                log("[ERROR] Model load failed: ${e.message}")
+                Log.e(TAG, "Model load", e)
+            }
+        }
     }
 
     private fun loadGrammar() {
@@ -157,7 +196,8 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     override fun onPartialResult(hypothesis: String?) {
         hypothesis ?: return
         val text = extractText(hypothesis)
-        if (text.isBlank()) return
+        if (text.isBlank() || text == lastPartial) return
+        lastPartial = text
 
         when (state) {
             State.LISTENING -> {
@@ -168,13 +208,21 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
             }
             State.CAPTURING -> {
                 partialLabel.text = text
+                capturedText.clear()
+                capturedText.append(text)
             }
             else -> {}
         }
     }
 
     override fun onResult(hypothesis: String?) {
-        // Final result — not used in our architecture (we use partial results)
+        hypothesis ?: return
+        val text = extractText(hypothesis)
+        if (text.isBlank()) return
+        if (state == State.CAPTURING) {
+            capturedText.clear()
+            capturedText.append(text)
+        }
     }
 
     override fun onFinalResult(hypothesis: String?) {
@@ -197,10 +245,24 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
 
     override fun onError(e: Exception?) {
         log("[ERROR] VOSK: $e")
+        // Try to restart on transient errors
+        if (state == State.LISTENING || state == State.CAPTURING) {
+            handler.postDelayed({
+                try {
+                    speechService?.stop()
+                    startListening()
+                    log("[INFO] SpeechService restarted after error")
+                } catch (ex: Exception) {
+                    log("[ERROR] Restart failed: ${ex.message}")
+                }
+            }, 1000)
+        }
     }
 
     override fun onTimeout() {
-        if (state == State.CAPTURING) {
+        if (state == State.CAPTURING && capturedText.isNotBlank()) {
+            state = State.PROCESSING
+            updateStateUI()
             processCommand()
         }
     }
@@ -214,8 +276,10 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         updateStateUI()
 
         val recognizer = Recognizer(model, SAMPLE_RATE)
+        // Use VOICE_RECOGNITION source — works better on some devices than MIC
         speechService = SpeechService(recognizer, SAMPLE_RATE)
         speechService?.startListening(this)
+        log("[INFO] SpeechService started (mic listening)")
     }
 
     private fun onWakeWordDetected() {
@@ -223,9 +287,12 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         state = State.CAPTURING
         captureStart = System.currentTimeMillis()
         capturedText.clear()
+        lastPartial = ""
+        responseLabel.text = "Говорите..."
+        responseLabel.setTextColor(0xFFFFAA33.toInt())
         updateStateUI()
 
-        // Таймаут: если пользователь молчит > PACKET_TIMEOUT → process
+        // Fallback timeout
         handler.postDelayed({
             if (state == State.CAPTURING) {
                 state = State.PROCESSING
@@ -438,5 +505,21 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         speechService?.shutdown()
         model?.close()
         super.onDestroy()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Restart listening if model is loaded but service stopped
+        if (model != null && (speechService == null || state != State.LOADING)) {
+            handler.postDelayed({
+                if (state == State.LISTENING || state == State.CAPTURING) {
+                    try {
+                        speechService?.stop()
+                    } catch (_: Exception) {}
+                    startListening()
+                    log("[INFO] SpeechService resumed")
+                }
+            }, 500)
+        }
     }
 }
