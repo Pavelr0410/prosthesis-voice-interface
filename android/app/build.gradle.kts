@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.ccmnp.voicecontrol"
+    namespace = "com.ccmnp.voskbench"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.ccmnp.voicecontrol"
+        applicationId = "com.ccmnp.voskbench"
         minSdk = 26
         targetSdk = 34
         versionCode = 1

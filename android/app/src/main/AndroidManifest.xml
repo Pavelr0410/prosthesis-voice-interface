@@ -8,8 +8,8 @@
 
     <application
         android:allowBackup="true"
-        android:label="ГолосЖест"
-        android:theme="@style/Theme.VoiceControl">
+        android:label="VOSK Bench"
+        android:theme="@style/Theme.VoskBench">
 
         <activity
             android:name=".MainActivity"

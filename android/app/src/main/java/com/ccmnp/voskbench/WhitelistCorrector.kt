@@ -1,4 +1,4 @@
-package com.ccmnp.voicecontrol
+package com.ccmnp.voskbench
 
 /**
  * Пословный whitelist-корректор для free-form VOSK вывода.

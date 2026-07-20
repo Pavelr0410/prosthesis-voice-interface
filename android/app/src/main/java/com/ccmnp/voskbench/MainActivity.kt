@@ -1,4 +1,4 @@
-package com.ccmnp.voicecontrol
+package com.ccmnp.voskbench
 
 import android.Manifest
 import android.content.pm.PackageManager
@@ -74,6 +74,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
 
     private val logLines = mutableListOf<String>()
     private val handler = Handler(Looper.getMainLooper())
+    private var lastPartialTime = System.currentTimeMillis()
 
     // ── End-word synonyms ─────────────────────────────────────
     private val endSynonyms = setOf(
@@ -107,6 +108,19 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         logScroll = findViewById(R.id.logScroll)
 
         ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), PERMISSION_RECORD)
+
+        // Watchdog: restart SpeechService if no partials for 10s
+        handler.postDelayed(object : Runnable {
+            override fun run() {
+                if (state != State.LOADING && System.currentTimeMillis() - lastPartialTime > 10000) {
+                    log("[WATCHDOG] No partials for 10s, restarting SpeechService")
+                    try { speechService?.stop() } catch (_: Exception) {}
+                    if (model != null) startListening()
+                    lastPartialTime = System.currentTimeMillis()
+                }
+                handler.postDelayed(this, 5000)
+            }
+        }, 10000)
     }
 
     // ── Разрешения ────────────────────────────────────────────
@@ -198,6 +212,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         val text = extractText(hypothesis)
         if (text.isBlank() || text == lastPartial) return
         lastPartial = text
+        lastPartialTime = System.currentTimeMillis()
 
         when (state) {
             State.LISTENING -> {

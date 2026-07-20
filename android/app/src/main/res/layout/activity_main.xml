@@ -50,6 +50,19 @@
         android:background="#FF222233"
         android:layout_marginBottom="4dp" />
 
+    <!-- Инструкция -->
+    <TextView
+        android:id="@+id/helpText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/help_text"
+        android:textColor="#FF666688"
+        android:textSize="11sp"
+        android:fontFamily="monospace"
+        android:padding="6dp"
+        android:background="#FF0D0D14"
+        android:layout_marginBottom="6dp" />
+
     <!-- Лог (70% высоты) -->
     <ScrollView
         android:id="@+id/logScroll"
