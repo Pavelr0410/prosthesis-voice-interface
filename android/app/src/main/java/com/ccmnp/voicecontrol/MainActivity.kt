@@ -47,7 +47,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         private const val SAMPLE_RATE = 16000f
         private const val PERMISSION_RECORD = 1001
         private const val PACKET_TIMEOUT = 5000L      // макс. длительность захвата
-        private const val MATCH_THRESHOLD = 0.85      // порог fuzzy match
+        private const val MATCH_THRESHOLD = 0.85      // порог fuzzy match (верифицирован 2026-07-20: Clean 74%, FP 2.5%)
         private const val KEYWORD = "протез"
     }
 
@@ -60,6 +60,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     private var captureStart = 0L
     private val capturedText = StringBuilder()
     private val grammarList = mutableListOf<String>()
+    private val whitelistWords = mutableSetOf<String>()
 
     // ── UI ────────────────────────────────────────────────────
     private lateinit var stateLabel: TextView
@@ -142,7 +143,8 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
             for (i in 0 until arr.length()) {
                 grammarList.add(arr.getString(i).lowercase())
             }
-            log("[INFO] Грамматика: ${grammarList.size} фраз")
+            whitelistWords.addAll(WhitelistCorrector.buildWhitelist(grammarList))
+            log("[INFO] Грамматика: ${grammarList.size} фраз, ${whitelistWords.size} слов")
         } catch (e: IOException) {
             log("[WARN] grammar.json not found: $e")
         }
@@ -248,8 +250,19 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
             return
         }
 
+        // Whitelist corrector (if raw looks like a command)
+        val textForMatch = if (WhitelistCorrector.shouldCorrect(raw, whitelistWords)) {
+            val corrected = WhitelistCorrector.correctPhrase(raw, whitelistWords)
+            if (corrected != raw.lowercase()) {
+                log("[CORR] '$raw' → '$corrected'")
+            }
+            corrected
+        } else {
+            raw.lowercase()
+        }
+
         // Fuzzy match против grammar.json
-        val (matched, score) = fuzzyMatch(raw)
+        val (matched, score) = fuzzyMatch(textForMatch)
 
         val displayText = if (matched != null) {
             log("[MATCH] ${"%.1f".format(score * 100)}% → '$matched'")
