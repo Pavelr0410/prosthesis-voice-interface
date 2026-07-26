@@ -1,21 +1,26 @@
 package com.ccmnp.voskbench
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.widget.Button
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.ccmnp.voskbench.services.VoiceRecognitionService
 import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -23,24 +28,12 @@ import org.vosk.Model
 import org.vosk.Recognizer
 import org.vosk.android.RecognitionListener
 import org.vosk.android.SpeechService
-import org.vosk.android.StorageService
-import java.io.IOException
 import java.io.File
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.zip.ZipInputStream
 import kotlin.math.max
-
-/* ================================================================
- * ГолосЖест — голосовое управление бионическим протезом
- * Android-стенд для портирования VOSK real-time UI
- *
- * Архитектура:
- *   - VOSK small-ru-0.22, свободное распознавание + fuzzy match
- *   - Состояния: LOADING → LISTENING → CAPTURING → PROCESSING → LISTENING
- *   - Wake word: "протез"
- *   - Команды: жест <payload> выполняй | статус выполняй
- * ================================================================ */
 
 class MainActivity : AppCompatActivity(), RecognitionListener {
 
@@ -48,12 +41,13 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         private const val TAG = "VoiceControl"
         private const val SAMPLE_RATE = 16000f
         private const val PERMISSION_RECORD = 1001
-        private const val PACKET_TIMEOUT = 5000L      // макс. длительность захвата (8s)
-        private const val MATCH_THRESHOLD = 0.85      // порог fuzzy match (верифицирован 2026-07-20: Clean 74%, FP 2.5%)
+        private const val PERMISSION_BLUETOOTH = 1002
+        private const val PACKET_TIMEOUT = 5000L
+        private const val MATCH_THRESHOLD = 0.85
         private const val KEYWORD = "протез"
+        private const val RESET_TIMEOUT = 3000L
     }
 
-    // ── Состояние ────────────────────────────────────────────
     private enum class State { LOADING, LISTENING, CAPTURING, PROCESSING }
 
     private var state = State.LOADING
@@ -65,24 +59,34 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     private val grammarList = mutableListOf<String>()
     private val whitelistWords = mutableSetOf<String>()
 
-    // ── UI ────────────────────────────────────────────────────
+    private var buttonTimerStart = 0L
+    private var isTimerRunning = false
+    private var lastSpeechTime = 0L
+    private var resetRunnable: Runnable? = null
+
+    private var isServiceRunning = false
+
+    private lateinit var bluetoothManager: BluetoothModbusManager
+    private var isBluetoothConnected = false
+
     private lateinit var stateLabel: TextView
     private lateinit var partialLabel: TextView
     private lateinit var responseLabel: TextView
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
+    private lateinit var timerButton: Button
+    private lateinit var serviceToggleButton: Button
+    private lateinit var btConnectButton: Button
 
     private val logLines = mutableListOf<String>()
     private val handler = Handler(Looper.getMainLooper())
     private var lastPartialTime = System.currentTimeMillis()
 
-    // ── End-word synonyms ─────────────────────────────────────
     private val endSynonyms = setOf(
         "выполнять", "выполняй", "выполняйте", "выполни",
         "поехали", "давай", "старт"
     )
 
-    // ── Gestures ──────────────────────────────────────────────
     private val gestures = setOf(
         "нейтральный", "нейтраль", "большой палец",
         "сжатие пальцев", "сжатие", "кулак",
@@ -93,9 +97,15 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         "экстензия", "разгибание"
     )
 
-    // ═══════════════════════════════════════════════════════════
-    // Жизненный цикл
-    // ═══════════════════════════════════════════════════════════
+    private val keywordReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == "KEYWORD_DETECTED") {
+                val keyword = intent.getStringExtra("keyword") ?: return
+                log("*** КЛЮЧЕВОЕ СЛОВО ИЗ СЕРВИСА: '$keyword' ***")
+                onWakeWordDetected()
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -106,10 +116,47 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         responseLabel = findViewById(R.id.responseLabel)
         logText = findViewById(R.id.logText)
         logScroll = findViewById(R.id.logScroll)
+        timerButton = findViewById(R.id.timerButton)
+        serviceToggleButton = findViewById(R.id.serviceToggleButton)
+        btConnectButton = findViewById(R.id.btConnectButton)
 
-        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), PERMISSION_RECORD)
+        bluetoothManager = BluetoothModbusManager(this)
 
-        // Watchdog: restart SpeechService if no partials for 10s
+        timerButton.setOnClickListener {
+            startTimer()
+        }
+
+        serviceToggleButton.setOnClickListener {
+            toggleVoiceService()
+        }
+
+        btConnectButton.setOnClickListener {
+            checkBluetoothPermissionsAndConnect()
+        }
+
+        val filter = IntentFilter("KEYWORD_DETECTED")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(keywordReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(keywordReceiver, filter)
+        }
+
+        // 🔥 ЗАПРАШИВАЕМ РАЗРЕШЕНИЯ
+        requestPermissions()
+
+        // 🔥 ПРИНУДИТЕЛЬНО ЗАПУСКАЕМ VOSK через 2 секунды
+        handler.postDelayed({
+            log("⏰ Принудительный запуск VOSK через 2 секунды...")
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                log("✅ Разрешение на микрофон есть, запускаем VOSK")
+                initModel()
+            } else {
+                log("❌ Нет разрешения на микрофон, запрашиваем...")
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), PERMISSION_RECORD)
+            }
+        }, 2000)
+
+        // Watchdog
         handler.postDelayed(object : Runnable {
             override fun run() {
                 if (state != State.LOADING && System.currentTimeMillis() - lastPartialTime > 10000) {
@@ -123,22 +170,207 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         }, 10000)
     }
 
-    // ── Разрешения ────────────────────────────────────────────
+    private fun requestPermissions() {
+        val permissions = mutableListOf<String>()
+        permissions.add(Manifest.permission.RECORD_AUDIO)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+        } else {
+            permissions.add(Manifest.permission.BLUETOOTH)
+            permissions.add(Manifest.permission.BLUETOOTH_ADMIN)
+        }
+        permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        permissions.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+
+        val missingPermissions = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missingPermissions.isNotEmpty()) {
+            log("📢 Запрашиваем разрешения: ${missingPermissions.joinToString()}")
+            ActivityCompat.requestPermissions(
+                this,
+                missingPermissions.toTypedArray(),
+                PERMISSION_BLUETOOTH
+            )
+        } else {
+            log("✅ Все разрешения уже есть")
+        }
+    }
+
+    private fun checkBluetoothPermissionsAndConnect() {
+        val hasBluetoothPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH) == PackageManager.PERMISSION_GRANTED
+        }
+
+        if (!hasBluetoothPermission) {
+            Toast.makeText(this, "Нет разрешения на Bluetooth", Toast.LENGTH_SHORT).show()
+            requestPermissions()
+            return
+        }
+
+        showBluetoothDevicesDialog()
+    }
+
+    private fun showBluetoothDevicesDialog() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                Toast.makeText(this, "Нет разрешения на Bluetooth", Toast.LENGTH_SHORT).show()
+                requestPermissions()
+                return
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                Toast.makeText(this, "Нет разрешения на сканирование Bluetooth", Toast.LENGTH_SHORT).show()
+                requestPermissions()
+                return
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH) != PackageManager.PERMISSION_GRANTED) {
+                Toast.makeText(this, "Нет разрешения на Bluetooth", Toast.LENGTH_SHORT).show()
+                requestPermissions()
+                return
+            }
+        }
+
+        val devices = bluetoothManager.getPairedDevices()
+        if (devices.isEmpty()) {
+            Toast.makeText(
+                this,
+                "Нет сопряженных устройств. Сопрягите устройство в настройках Bluetooth.",
+                Toast.LENGTH_LONG
+            ).show()
+            log("[BLUETOOTH] Нет сопряженных устройств")
+            return
+        }
+
+        val deviceNames = devices.map { "${it.name} (${it.address})" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Выберите Bluetooth устройство")
+            .setItems(deviceNames) { _, which ->
+                val device = devices[which]
+                connectBluetoothDevice(device.address)
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun connectBluetoothDevice(deviceAddress: String) {
+        log("[BLUETOOTH] Подключение к $deviceAddress...")
+        Toast.makeText(this, "Подключение к устройству...", Toast.LENGTH_SHORT).show()
+
+        if (bluetoothManager.connect(deviceAddress)) {
+            isBluetoothConnected = true
+            saveDeviceAddress(deviceAddress)
+            log("[BLUETOOTH] ✅ Подключено к $deviceAddress")
+            btConnectButton.text = "Bluetooth: Подключено"
+            btConnectButton.setBackgroundColor(0xFF4CAF50.toInt())
+            Toast.makeText(this, "✅ Подключено!", Toast.LENGTH_SHORT).show()
+        } else {
+            isBluetoothConnected = false
+            log("[BLUETOOTH] ❌ Ошибка подключения к $deviceAddress")
+            Toast.makeText(this, "❌ Ошибка подключения", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun saveDeviceAddress(address: String) {
+        val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
+        prefs.edit().putString("bt_device_address", address).apply()
+    }
+
+    private fun getSavedDeviceAddress(): String? {
+        val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
+        return prefs.getString("bt_device_address", null)
+    }
+
+    private fun sendModbusCommand(gesture: String) {
+        if (!isBluetoothConnected) {
+            val savedAddress = getSavedDeviceAddress()
+            if (savedAddress != null) {
+                log("[BLUETOOTH] Попытка подключения к сохраненному устройству...")
+                if (bluetoothManager.connect(savedAddress)) {
+                    isBluetoothConnected = true
+                    btConnectButton.text = "Bluetooth: Подключено"
+                    btConnectButton.setBackgroundColor(0xFF4CAF50.toInt())
+                    log("[BLUETOOTH] ✅ Подключено к сохраненному устройству")
+                } else {
+                    log("[BLUETOOTH] ❌ Не удалось подключиться к сохраненному устройству")
+                    Toast.makeText(this, "Сначала подключите Bluetooth устройство", Toast.LENGTH_SHORT).show()
+                    return
+                }
+            } else {
+                log("[BLUETOOTH] ❌ Нет сохраненного Bluetooth устройства")
+                Toast.makeText(this, "Сначала подключите Bluetooth устройство", Toast.LENGTH_SHORT).show()
+                return
+            }
+        }
+
+        val result = bluetoothManager.sendCommand(gesture)
+        if (result) {
+            log("[BLUETOOTH] ✅ Команда '$gesture' отправлена")
+            btConnectButton.text = "✅ $gesture отправлено"
+            handler.postDelayed({
+                btConnectButton.text = "Bluetooth: Подключено"
+            }, 1500)
+        } else {
+            log("[BLUETOOTH] ❌ Ошибка отправки команды '$gesture'")
+            isBluetoothConnected = false
+            btConnectButton.text = "Bluetooth: Ошибка"
+            btConnectButton.setBackgroundColor(0xFFFF4444.toInt())
+            handler.postDelayed({
+                btConnectButton.text = "Bluetooth: Подключено"
+                btConnectButton.setBackgroundColor(0xFF4CAF50.toInt())
+            }, 2000)
+        }
+    }
+
+    override fun onDestroy() {
+        try {
+            unregisterReceiver(keywordReceiver)
+        } catch (_: Exception) {}
+        speechService?.stop()
+        speechService?.shutdown()
+        model?.close()
+        resetTimer()
+        bluetoothManager.disconnect()
+        super.onDestroy()
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int, permissions: Array<out String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == PERMISSION_RECORD && grantResults.isNotEmpty()
-            && grantResults[0] == PackageManager.PERMISSION_GRANTED
-        ) {
-            initModel()
-        } else {
-            Toast.makeText(this, "Нужен доступ к микрофону", Toast.LENGTH_LONG).show()
+        log("📢 onRequestPermissionsResult: requestCode=$requestCode")
+
+        when (requestCode) {
+            PERMISSION_RECORD -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    log("✅ Разрешение на микрофон ПОЛУЧЕНО")
+                    initModel()
+                } else {
+                    log("❌ Разрешение на микрофон ОТКЛОНЕНО!")
+                    Toast.makeText(this, "Нужен доступ к микрофону", Toast.LENGTH_LONG).show()
+                }
+            }
+            PERMISSION_BLUETOOTH -> {
+                val allGranted = grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+                if (allGranted) {
+                    log("✅ Bluetooth разрешения получены")
+                    Toast.makeText(this, "Bluetooth разрешения получены", Toast.LENGTH_SHORT).show()
+                    showBluetoothDevicesDialog()
+                } else {
+                    log("❌ Bluetooth разрешения ОТКЛОНЕНЫ")
+                    Toast.makeText(this, "Нужны разрешения для Bluetooth", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
-    // ── Модель: загрузка вручную ───────────────────────────────
     private fun initModel() {
+        log("========== initModel() ВЫЗВАН ==========")
         state = State.LOADING
         updateStateUI()
 
@@ -147,7 +379,9 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
                 val modelDir = File(filesDir, "model-ru")
                 val confFile = File(modelDir, "conf/model.conf")
 
-                // Already extracted?
+                log("📁 Путь к модели: ${modelDir.absolutePath}")
+                log("📁 conf/model.conf существует: ${confFile.exists()}")
+
                 if (!confFile.exists()) {
                     log("[INFO] Extracting model-ru.zip...")
                     modelDir.deleteRecursively()
@@ -157,7 +391,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
                     ZipInputStream(zipBytes.inputStream()).use { zis ->
                         var entry = zis.nextEntry
                         while (entry != null) {
-                            // Strip "model-ru/" prefix from ZIP entries
                             var entryName = entry.name
                             if (entryName.startsWith("model-ru/")) {
                                 entryName = entryName.substringAfter("model-ru/")
@@ -177,13 +410,22 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
                     log("[INFO] Model extracted: $fileCount files")
                 }
 
+                log("🔄 Загружаем модель VOSK...")
                 val m = Model(modelDir.absolutePath)
                 model = m
+                log("✅ МОДЕЛЬ ЗАГРУЖЕНА УСПЕШНО!")
+
                 loadGrammar()
                 log("[INFO] VOSK загружен")
-                withContext(Dispatchers.Main) { startListening() }
+
+                withContext(Dispatchers.Main) {
+                    log("📢 Запускаем startListening()...")
+                    startListening()
+                    log("✅ startListening() вызван в initModel()")
+                }
             } catch (e: Exception) {
                 log("[ERROR] Model load failed: ${e.message}")
+                log("Stack trace: ${e.stackTraceToString()}")
                 Log.e(TAG, "Model load", e)
             }
         }
@@ -203,9 +445,81 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // VOSK RecognitionListener
-    // ═══════════════════════════════════════════════════════════
+    private fun toggleVoiceService() {
+        if (isServiceRunning) {
+            stopVoiceService()
+        } else {
+            startVoiceService()
+        }
+    }
+
+    private fun startVoiceService() {
+        val intent = Intent(this, VoiceRecognitionService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        isServiceRunning = true
+        serviceToggleButton.text = "Остановить фоновый режим"
+        serviceToggleButton.setBackgroundColor(0xFFFF4444.toInt())
+        log("[СЕРВИС] Запущен фоновый режим")
+    }
+
+    private fun stopVoiceService() {
+        val intent = Intent(this, VoiceRecognitionService::class.java)
+        stopService(intent)
+        isServiceRunning = false
+        serviceToggleButton.text = "Запустить фоновый режим"
+        serviceToggleButton.setBackgroundColor(0xFF2196F3.toInt())
+        log("[СЕРВИС] Фоновый режим остановлен")
+    }
+
+    private fun startTimer() {
+        resetTimer()
+        buttonTimerStart = System.currentTimeMillis()
+        isTimerRunning = true
+        lastSpeechTime = System.currentTimeMillis()
+
+        timerButton.text = "Таймер запущен..."
+        timerButton.setBackgroundColor(0xFF4CAF50.toInt())
+
+        log("[ТАЙМЕР] Запущен")
+        scheduleReset()
+    }
+
+    private fun resetTimer() {
+        isTimerRunning = false
+        buttonTimerStart = 0L
+        lastSpeechTime = 0L
+
+        resetRunnable?.let { handler.removeCallbacks(it) }
+        resetRunnable = null
+
+        timerButton.text = "Старт таймера"
+        timerButton.setBackgroundColor(0xFF2196F3.toInt())
+
+        log("[ТАЙМЕР] Сброшен")
+    }
+
+    private fun scheduleReset() {
+        resetRunnable?.let { handler.removeCallbacks(it) }
+        resetRunnable = Runnable {
+            if (isTimerRunning && System.currentTimeMillis() - lastSpeechTime >= RESET_TIMEOUT) {
+                log("[ТАЙМЕР] Сброс по таймауту (${RESET_TIMEOUT}ms без речи)")
+                resetTimer()
+            }
+        }
+        handler.postDelayed(resetRunnable!!, RESET_TIMEOUT)
+    }
+
+    private fun getDuration(): Long {
+        return if (isTimerRunning && buttonTimerStart > 0) {
+            System.currentTimeMillis() - buttonTimerStart
+        } else {
+            0L
+        }
+    }
 
     override fun onPartialResult(hypothesis: String?) {
         hypothesis ?: return
@@ -214,11 +528,27 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         lastPartial = text
         lastPartialTime = System.currentTimeMillis()
 
+        if (isTimerRunning) {
+            lastSpeechTime = System.currentTimeMillis()
+            scheduleReset()
+        }
+
         when (state) {
             State.LISTENING -> {
-                log("[СЛУШАЮ] $text")
-                if (text.contains(KEYWORD, ignoreCase = true)) {
-                    onWakeWordDetected()
+                if (isTimerRunning) {
+                    val duration = getDuration()
+                    log("[СЛУШАЮ] $text (${duration}ms)")
+                    if (text.contains(KEYWORD, ignoreCase = true)) {
+                        log("*** КЛЮЧЕВОЕ СЛОВО: '$KEYWORD' *** (${duration}ms)")
+                        resetTimer()
+                        onWakeWordDetected()
+                    }
+                } else {
+                    log("[СЛУШАЮ] $text")
+                    if (text.contains(KEYWORD, ignoreCase = true)) {
+                        log("*** КЛЮЧЕВОЕ СЛОВО: '$KEYWORD' ***")
+                        onWakeWordDetected()
+                    }
                 }
             }
             State.CAPTURING -> {
@@ -247,8 +577,18 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
 
         when (state) {
             State.LISTENING -> {
-                if (text.contains(KEYWORD, ignoreCase = true)) {
-                    onWakeWordDetected()
+                if (isTimerRunning) {
+                    val duration = getDuration()
+                    log("[ФИНАЛ] $text (${duration}ms)")
+                    if (text.contains(KEYWORD, ignoreCase = true)) {
+                        log("*** КЛЮЧЕВОЕ СЛОВО: '$KEYWORD' *** (${duration}ms)")
+                        resetTimer()
+                        onWakeWordDetected()
+                    }
+                } else {
+                    if (text.contains(KEYWORD, ignoreCase = true)) {
+                        onWakeWordDetected()
+                    }
                 }
             }
             State.CAPTURING -> {
@@ -259,8 +599,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     }
 
     override fun onError(e: Exception?) {
-        log("[ERROR] VOSK: $e")
-        // Try to restart on transient errors
+        log("[ERROR] VOSK: ${e?.message}")
         if (state == State.LISTENING || state == State.CAPTURING) {
             handler.postDelayed({
                 try {
@@ -282,19 +621,39 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // Логика автомата
-    // ═══════════════════════════════════════════════════════════
-
     private fun startListening() {
+        //log("========== startListening() ВЫЗВАН ==========")
         state = State.LISTENING
         updateStateUI()
-
-        val recognizer = Recognizer(model, SAMPLE_RATE)
-        // Use VOICE_RECOGNITION source — works better on some devices than MIC
-        speechService = SpeechService(recognizer, SAMPLE_RATE)
-        speechService?.startListening(this)
         log("[INFO] SpeechService started (mic listening)")
+
+        try {
+            if (model == null) {
+                log("❌ model == null! Не могу запустить SpeechService")
+                return
+            }
+
+            //log("🔄 Создаем Recognizer...")
+            val recognizer = Recognizer(model, SAMPLE_RATE)
+            //log("✅ Recognizer создан")
+
+            //log("🔄 Создаем SpeechService...")
+            speechService = SpeechService(recognizer, SAMPLE_RATE)
+            //log("✅ SpeechService создан")
+
+            //log("🔄 Запускаем SpeechService...")
+            speechService?.startListening(this)
+            //log("✅ SpeechService успешно запущен")
+
+            // Принудительно обновляем UI
+            handler.post {
+                stateLabel.text = "[СЛУШАЮ] Ожидание ключевого слова..."
+                stateLabel.setTextColor(0xFF8099CC.toInt())
+            }
+        } catch (e: Exception) {
+            log("❌ Ошибка запуска SpeechService: ${e.message}")
+            e.printStackTrace()
+        }
     }
 
     private fun onWakeWordDetected() {
@@ -307,7 +666,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         responseLabel.setTextColor(0xFFFFAA33.toInt())
         updateStateUI()
 
-        // Fallback timeout
         handler.postDelayed({
             if (state == State.CAPTURING) {
                 state = State.PROCESSING
@@ -332,7 +690,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
             return
         }
 
-        // Whitelist corrector (if raw looks like a command)
         val textForMatch = if (WhitelistCorrector.shouldCorrect(raw, whitelistWords)) {
             val corrected = WhitelistCorrector.correctPhrase(raw, whitelistWords)
             if (corrected != raw.lowercase()) {
@@ -343,7 +700,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
             raw.lowercase()
         }
 
-        // Fuzzy match против grammar.json
         val (matched, score) = fuzzyMatch(textForMatch)
 
         val displayText = if (matched != null) {
@@ -357,7 +713,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         log("[ПАКЕТ] $displayText")
         partialLabel.text = ""
 
-        // Парсинг
         val parsed = parsePacket(displayText)
         if (parsed == null) {
             log("[!] KEYWORD not found in packet")
@@ -379,10 +734,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         updateStateUI()
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // Fuzzy match
-    // ═══════════════════════════════════════════════════════════
-
     private fun fuzzyMatch(raw: String): Pair<String?, Double> {
         val rawLower = raw.lowercase().trim()
         var bestMatch: String? = null
@@ -403,7 +754,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         }
     }
 
-    /** Simplified SequenceMatcher.ratio() */
     private fun similarity(a: String, b: String): Double {
         val m = Array(a.length + 1) { IntArray(b.length + 1) }
         for (i in a.indices) {
@@ -419,10 +769,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         val total = a.length + b.length
         return if (total == 0) 1.0 else (2.0 * lcs) / total
     }
-
-    // ═══════════════════════════════════════════════════════════
-    // Парсинг
-    // ═══════════════════════════════════════════════════════════
 
     private fun parsePacket(text: String): Map<String, String>? {
         val words = text.lowercase()
@@ -453,10 +799,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         return mapOf("command" to command, "payload" to payload)
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // Исполнение
-    // ═══════════════════════════════════════════════════════════
-
     private fun execute(parsed: Map<String, String>): String {
         val cmd = parsed["command"] ?: ""
         val payload = parsed["payload"] ?: ""
@@ -464,27 +806,39 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         return when (cmd) {
             "жест", "gesture" -> {
                 val gesture = gestures.find { it in payload }
-                if (gesture != null) "Жест: $gesture"
-                else "Не распознан"
+                if (gesture != null) {
+                    sendModbusCommand(gesture)
+                    "Жест: $gesture"
+                } else {
+                    "Не распознан"
+                }
             }
-            "статус", "status" -> "Батарея 66%"
+            "статус", "status" -> {
+                sendModbusCommand("status")
+                "Батарея 66%"
+            }
             else -> "Неизвестная команда: '$cmd'"
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // UI helpers
-    // ═══════════════════════════════════════════════════════════
-
     private fun updateStateUI() {
-        stateLabel.text = when (state) {
-            State.LOADING -> getString(R.string.state_loading)
-            State.LISTENING -> getString(R.string.state_listening)
-            State.CAPTURING -> {
-                val elapsed = (System.currentTimeMillis() - captureStart) / 1000.0
-                getString(R.string.state_capturing, elapsed, PACKET_TIMEOUT / 1000.0)
+        runOnUiThread {
+            stateLabel.text = when (state) {
+                State.LOADING -> "[ЗАГРУЗКА VOSK...]"
+                State.LISTENING -> "[СЛУШАЮ] Ожидание ключевого слова..."
+                State.CAPTURING -> {
+                    val elapsed = (System.currentTimeMillis() - captureStart) / 1000.0
+                    "⏺ [ЗАПИСЬ КОМАНДЫ] %.1fs / %.0fs".format(elapsed, PACKET_TIMEOUT / 1000.0)
+                }
+                State.PROCESSING -> "[ОБРАБОТКА...]"
             }
-            State.PROCESSING -> getString(R.string.state_processing)
+
+            stateLabel.setTextColor(when (state) {
+                State.LOADING -> 0xFFCCCCFF.toInt()
+                State.LISTENING -> 0xFF8099CC.toInt()
+                State.CAPTURING -> 0xFFFFAA33.toInt()
+                State.PROCESSING -> 0xFFFF6644.toInt()
+            })
         }
     }
 
@@ -511,20 +865,8 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // Завершение
-    // ═══════════════════════════════════════════════════════════
-
-    override fun onDestroy() {
-        speechService?.stop()
-        speechService?.shutdown()
-        model?.close()
-        super.onDestroy()
-    }
-
     override fun onResume() {
         super.onResume()
-        // Restart listening if model is loaded but service stopped
         if (model != null && (speechService == null || state != State.LOADING)) {
             handler.postDelayed({
                 if (state == State.LISTENING || state == State.CAPTURING) {

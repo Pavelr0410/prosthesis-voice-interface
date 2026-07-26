@@ -6,7 +6,6 @@
     android:padding="12dp"
     android:background="#FF0A0A0F">
 
-    <!-- Состояние -->
     <TextView
         android:id="@+id/stateLabel"
         android:layout_width="match_parent"
@@ -18,7 +17,6 @@
         android:fontFamily="monospace"
         android:padding="4dp" />
 
-    <!-- Partial (live) -->
     <TextView
         android:id="@+id/partialLabel"
         android:layout_width="match_parent"
@@ -30,7 +28,6 @@
         android:fontFamily="monospace"
         android:padding="2dp" />
 
-    <!-- Ответ -->
     <TextView
         android:id="@+id/responseLabel"
         android:layout_width="match_parent"
@@ -43,14 +40,49 @@
         android:padding="4dp"
         android:layout_marginBottom="8dp" />
 
-    <!-- Разделитель -->
+    <Button
+        android:id="@+id/timerButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Старт таймера"
+        android:textSize="16sp"
+        android:textColor="#FFFFFF"
+        android:backgroundTint="#2196F3"
+        android:padding="10dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginBottom="4dp"/>
+
+    <Button
+        android:id="@+id/serviceToggleButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Запустить фоновый режим"
+        android:textSize="16sp"
+        android:textColor="#FFFFFF"
+        android:backgroundTint="#FF9800"
+        android:padding="10dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginBottom="4dp"/>
+
+    <!-- 🆕 Кнопка подключения Bluetooth -->
+    <Button
+        android:id="@+id/btConnectButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Подключить Bluetooth"
+        android:textSize="14sp"
+        android:textColor="#FFFFFF"
+        android:backgroundTint="#9C27B0"
+        android:padding="8dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginBottom="4dp"/>
+
     <View
         android:layout_width="match_parent"
         android:layout_height="1dp"
         android:background="#FF222233"
         android:layout_marginBottom="4dp" />
 
-    <!-- Инструкция -->
     <TextView
         android:id="@+id/helpText"
         android:layout_width="match_parent"
@@ -63,7 +95,6 @@
         android:background="#FF0D0D14"
         android:layout_marginBottom="6dp" />
 
-    <!-- Лог (70% высоты) -->
     <ScrollView
         android:id="@+id/logScroll"
         android:layout_width="match_parent"
