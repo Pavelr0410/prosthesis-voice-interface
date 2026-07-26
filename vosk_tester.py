@@ -16,29 +16,12 @@ with open("grammar.json", "r", encoding="utf-8") as f:
 MODEL_PATH = "model-ru"
 TEST_FOLDER = "test_audio"
 THRESHOLD = 0.7
+CONFIDENCE_THRESHOLD = 0.6                                                        # Порог уверенности
 SAMPLE_RATE = 16000
 
 result_list = []
 true_count = 0
 missing_count_total = 0
-
-correct_list = {                                                                  # Список правильных фраз, для проверки в конце
-    "bolshoi_palez.wav": "протез жест большой палец выполняй",
-    "bolshoi_palez2.wav": "протез жест большой палец выполняйте",
-    "extensia.wav": "протез жест экстензия выполняй",
-    "flexija.wav": "протез жест флексия выполняй",
-    "kulak.wav": "протез жест кулак выполняйте",
-    "kulak2.wav": "протез жест кулак выполняйте",
-    "kulak3.wav": "протез жест кулак выполняй",
-    "neitralnyi.wav": "протез жест нейтральный выполняй",
-    "otkryt.wav": "протез жест открыть выполняй",
-    "shipok.wav": "протез жест щипок выполняй",
-    "status1.wav": "протез статус выполняй",
-    "status2.wav": "протез статус выполняй",
-    "status3.wav": "протез статус выполняй",
-    "szhatye_palzev.wav": "протез жест сжатие пальцев выполняй",
-    "ukazatelniy.wav": "протез жест указательный выполняй"
-}
 
 def similar(a, b):
     A = a.lower().strip()                                                          # распознанный текст VOSK (без лишних пробелов)
@@ -79,22 +62,37 @@ def analyze_word_coverage(text, grammar_list):            # Анализируе
     
     return total_words, missing_count, missing_words
 
+def get_confidence_from_result(result_json):                                   # Извлекает среднюю уверенность из результата Vosk
+    try:
+        if "result" in result_json and result_json["result"]:
+            confidences = []
+            for word_info in result_json["result"]:
+                if "conf" in word_info:
+                    confidences.append(word_info["conf"])                      # Составляет список с значениями conf каждого распознанного слова в result_json
+            if confidences:
+                return sum(confidences) / len(confidences)                     # Вычисляет среднее значение conf для всего предложения
+    except:
+        pass
+    return 0.0
+
 def transcribe_file(file_path, recognizer):
     start_time = time.time()
+    confidence = 0.0
     try:
         wf = wave.open(file_path, "rb")
         while True:
             data = wf.readframes(8000)                    # читает 8000 фреймов (пол секунды для 16кГц) аудиозаписи
             if len(data) == 0:
                 break
-            recognizer.AcceptWaveform(data)               # отправляет кусочек аудио "data" в распознаватель Vosk для обработки. Тот пишет True, если считает, что была произношена законченная фраза, и False, если ожидает ещё аудио
-        result = json.loads(recognizer.FinalResult())     # Финальная транскрипция Vosk в формате JSON переводится в словарь Python (путем json.loads)
-        text = result.get("text", "")                     # Извлекает из словаря распознанный текст. Если текст не был распознан, возвращает пустую строку ""
+            recognizer.AcceptWaveform(data)               # отправляет кусочек аудио "data" в распознаватель Vosk для обработки
+        result = json.loads(recognizer.FinalResult())     # Финальная транскрипция Vosk в формате JSON переводится в словарь Python
+        text = result.get("text", "")                     # Извлекает из словаря распознанный текст
+        confidence = get_confidence_from_result(result)   # Получаем уверенность распознавания
         wf.close()
     except Exception as e:
-        return "", time.time() - start_time
+        return "", time.time() - start_time, 0.0
     elapsed_ms = (time.time() - start_time) * 1000
-    return text, elapsed_ms
+    return text, elapsed_ms, confidence
 
 def main():
     global true_count, missing_count_total
@@ -119,6 +117,7 @@ def main():
     
     print(f"Found {len(wav_files)} files")
     print(f"Grammar has {len(grammar)} entries")
+    print(f"Confidence threshold: {CONFIDENCE_THRESHOLD}")
     
     total_time = 0
     result_list = []
@@ -129,17 +128,26 @@ def main():
         print(f"\n{filename}")
         
         rec = vosk.KaldiRecognizer(model, SAMPLE_RATE)
+        rec.SetWords(True)                                   # Включаем вывод информации о словах (включая уверенность)
         
         # Транскрипция
-        recognized, elapsed_ms = transcribe_file(file_path, rec)
+        recognized, elapsed_ms, confidence = transcribe_file(file_path, rec)
         total_time += elapsed_ms
         
-        # Поиск лучшега совпадения
+        # Проверяем порог уверенности
+        if confidence < CONFIDENCE_THRESHOLD:
+            print(f"⚠️  Low confidence: {confidence:.2%} < {CONFIDENCE_THRESHOLD:.2%}")
+            result_list.append(f" ⚠️ {filename}: низкая уверенность ({confidence:.1%}) | результат: '{recognized}'")
+            print(f"   Raw: '{recognized}'")
+            continue
+        
+        # Поиск лучшего совпадения
         best_match, best_score = find_best_match(recognized, grammar)
         
         # Поиск ошибок
         total_words, missing_count, missing_words = analyze_word_coverage(recognized, grammar)
         
+        print(f"Confidence: {confidence:.2%}")
         print(f"{elapsed_ms:.1f} ms")
         print(f"Raw: '{recognized}'")
         print(f"Words: {total_words} total, {missing_count} not in grammar")
@@ -148,17 +156,16 @@ def main():
             print(f"   Missing words: {', '.join(missing_words)}")
         
         if best_match:
-            if correct_list[filename] == best_match:
+            is_correct = (confidence >= CONFIDENCE_THRESHOLD)                       # Проверяем, что уверенность достаточна
+            if is_correct and best_score>=THRESHOLD:
                 true_count += 1
-                result_list.append(f" ✅ {filename}: {best_match} ({best_score:.1%}) | Кол. ошибок: {missing_count} из {total_words} слов")
-            else:
-                result_list.append(f" ❌ {filename}: {best_match} ({best_score:.1%}) | Кол. ошибок: {missing_count} из {total_words} слов")
-            if best_score >= THRESHOLD and correct_list[filename] == best_match:
                 print(f" ✅  Best match ({best_score:.1%}): '{best_match}'")
+                result_list.append(f" ✅ {filename}: {best_match} ({best_score:.1%}) | Уверенность: {confidence:.1%} | Ошибок: {missing_count}/{total_words}")
             else:
-                print(f" ⚠️  Best match ({best_score:.1%}): '{best_match}'")
+                print(f" ❌  Best match ({best_score:.1%}): '{best_match}'")
+                result_list.append(f" ❌ {filename}: {best_match} ({best_score:.1%}) | Уверенность: {confidence:.1%} | Ошибок: {missing_count}/{total_words}")
         else:
-            result_list.append(f" ❌ {filename}: не опознанно | Кол. ошибок: {missing_count} из {total_words} слов")
+            result_list.append(f" ❌ {filename}: не распознано | Уверенность: {confidence:.1%} | Ошибок: {missing_count}/{total_words}")
             print(f" ❌  No match found")
     
     # Сводка
@@ -168,6 +175,7 @@ def main():
     print(f"Обработанные файлы: {len(wav_files)}")
     print(f"Общее время: {total_time:.1f} ms")
     print(f"Средняя задержка: {total_time/len(wav_files):.1f} ms")
+    print(f"Порог уверенности: {CONFIDENCE_THRESHOLD:.1%}")
     print(f"\nРезультаты:")
     for result in result_list:
         print(result)

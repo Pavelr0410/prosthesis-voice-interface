@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp"
+    android:background="#FF0A0A0F">
+
+    <TextView
+        android:id="@+id/stateLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:text="@string/state_loading"
+        android:textColor="#FFCCCCFF"
+        android:textSize="20sp"
+        android:fontFamily="monospace"
+        android:padding="4dp" />
+
+    <TextView
+        android:id="@+id/partialLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:text=""
+        android:textColor="#FF6080CC"
+        android:textSize="14sp"
+        android:fontFamily="monospace"
+        android:padding="2dp" />
+
+    <TextView
+        android:id="@+id/responseLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:text=""
+        android:textColor="#FF44FF44"
+        android:textSize="22sp"
+        android:fontFamily="monospace"
+        android:padding="4dp"
+        android:layout_marginBottom="8dp" />
+
+    <Button
+        android:id="@+id/timerButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Старт таймера"
+        android:textSize="16sp"
+        android:textColor="#FFFFFF"
+        android:backgroundTint="#2196F3"
+        android:padding="10dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginBottom="4dp"/>
+
+    <Button
+        android:id="@+id/serviceToggleButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Запустить фоновый режим"
+        android:textSize="16sp"
+        android:textColor="#FFFFFF"
+        android:backgroundTint="#FF9800"
+        android:padding="10dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginBottom="4dp"/>
+
+    <!-- 🆕 Кнопка подключения Bluetooth -->
+    <Button
+        android:id="@+id/btConnectButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Подключить Bluetooth"
+        android:textSize="14sp"
+        android:textColor="#FFFFFF"
+        android:backgroundTint="#9C27B0"
+        android:padding="8dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginBottom="4dp"/>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="#FF222233"
+        android:layout_marginBottom="4dp" />
+
+    <TextView
+        android:id="@+id/helpText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/help_text"
+        android:textColor="#FF666688"
+        android:textSize="11sp"
+        android:fontFamily="monospace"
+        android:padding="6dp"
+        android:background="#FF0D0D14"
+        android:layout_marginBottom="6dp" />
+
+    <ScrollView
+        android:id="@+id/logScroll"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true">
+
+        <TextView
+            android:id="@+id/logText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="top|start"
+            android:text=""
+            android:textColor="#FF999999"
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:padding="8dp" />
+    </ScrollView>
+
+</LinearLayout>
