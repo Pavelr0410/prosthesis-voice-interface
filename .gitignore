@@ -225,3 +225,10 @@ vosk-model-ru-0.42/
 *.zip
 *.tar.gz
 verification_report_*.json
+
+# Логи приложений
+logs_vosk/
+
+# Внешние зависимости (ставятся отдельно, в репозиторий не входят)
+pyMotoricaInterface/
+BLE_connect.py

@@ -23,6 +23,7 @@ class VoiceRecognitionService : Service(), RecognitionListener {
         private const val NOTIFICATION_ID = 1001
         private const val CHANNEL_ID = "voice_control_channel"
         private const val KEYWORD = "протез"
+        private const val KEYWORD_MATCH_THRESHOLD = 0.6
     }
 
     private var speechService: SpeechService? = null
@@ -183,7 +184,7 @@ class VoiceRecognitionService : Service(), RecognitionListener {
 
         Log.d(TAG, "[СЛУШАЮ] $text")
 
-        if (text.contains(KEYWORD, ignoreCase = true)) {
+        if (matchesKeyword(text)) {
             Log.d(TAG, "*** КЛЮЧЕВОЕ СЛОВО: '$KEYWORD' ***")
             sendKeywordBroadcast()
         }
@@ -244,6 +245,36 @@ class VoiceRecognitionService : Service(), RecognitionListener {
         } catch (e: Exception) {
             ""
         }
+    }
+
+    // ── Фаззи-детекция ключевого слова (порог 60%) ─────────────
+    private fun matchesKeyword(text: String): Boolean {
+        val words = text.lowercase()
+            .replace(Regex("[^\\w\\s]"), "")
+            .split("\\s+".toRegex())
+            .filter { it.isNotBlank() }
+        for (w in words) {
+            if (w.length >= 4 && similarity(w, KEYWORD) >= KEYWORD_MATCH_THRESHOLD) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun similarity(a: String, b: String): Double {
+        val m = Array(a.length + 1) { IntArray(b.length + 1) }
+        for (i in a.indices) {
+            for (j in b.indices) {
+                m[i + 1][j + 1] = if (a[i] == b[j]) {
+                    m[i][j] + 1
+                } else {
+                    maxOf(m[i + 1][j], m[i][j + 1])
+                }
+            }
+        }
+        val lcs = m[a.length][b.length]
+        val total = a.length + b.length
+        return if (total == 0) 1.0 else (2.0 * lcs) / total
     }
 
     override fun onDestroy() {
