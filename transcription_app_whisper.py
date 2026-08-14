@@ -1,20 +1,24 @@
 """
-transcription_app_vosk_2.py
-============================
-Real-time распознавание голосовых команд через VOSK + кнопки команд.
+transcription_app_vosk_whisper.py
+==================================
+Real-time распознавание голосовых команд через Whisper (faster-whisper, small) + кнопки команд.
 
-Отличается от transcription_app_vosk.py наличием правой панели с кнопками:
-  - каждая кнопка соответствует одной команде протеза;
-  - нажатие немедленно отправляет жест на плату Fest через MotoricaInterface;
-  - голосовой пайплайн (wake word "протез") сохранён.
+Отличается от transcription_app_vosk_2.py движком распознавания:
+  - вместо Vosk используется faster-whisper (Whisper-small, cpu/int8);
+  - Whisper — батчевая модель, поэтому транскрипция выполняется в фоновом потоке.
 
 Архитектура:
-  - 2 фоновых потока: audio capture, VOSK worker
+  - 2 фоновых потока: audio capture, Whisper worker
   - Основной поток Kivy — GUI (голосовой интерфейс слева, кнопки справа)
   - Внешний VAD (webrtcvad) управляет пайплайном
 """
 
 import os
+
+# Windows: конфликт двух копий OpenMP (MKL/numpy + ctranslate2/faster-whisper)
+# без этого OMP Error #15 аварийно завершает процесс.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import re
 import time
 import json
@@ -30,6 +34,7 @@ import numpy as np
 import pyaudio
 import webrtcvad
 import vosk
+from faster_whisper import WhisperModel
 from bleak import BleakClient, BleakScanner
 
 from kivy.app import App
@@ -74,6 +79,13 @@ VAD_AGGRESSIVE = 3
 VAD_FRAME_MS   = 30
 SILENCE_SEC    = 0.8
 MATCH_THRESHOLD = 0.85
+
+# Whisper (faster-whisper)
+# tiny — быстрее всего (~1с/команду на CPU); base/small — точнее, но медленнее.
+WHISPER_MODEL_SIZE = "base"
+WHISPER_DEVICE = "cpu"
+WHISPER_COMPUTE_TYPE = "int8"
+WHISPER_CPU_THREADS = 8
 
 GESTURES = {
     "нейтральный", "нейтраль",
@@ -243,7 +255,8 @@ class VoskVoiceApp(App):
 
     def build(self):
         self.state = State.LOADING
-        self.model = None
+        self.vosk_model = None
+        self.whisper_model = None
         try:
             self.grammar_str = json.dumps(json.load(open(GRAMMAR_PATH, encoding="utf-8")))
         except Exception as e:
@@ -279,7 +292,7 @@ class VoskVoiceApp(App):
 
         threading.Thread(target=self._load_model, daemon=True).start()
         threading.Thread(target=self._audio_capture, daemon=True).start()
-        threading.Thread(target=self._vosk_worker, daemon=True).start()
+        threading.Thread(target=self._whisper_worker, daemon=True).start()
 
         # ── Корневой layout (горизонтальный: голосовой интерфейс + кнопки) ──
         self.root_box = BoxLayout(orientation='horizontal', spacing=6, padding=6)
@@ -292,7 +305,7 @@ class VoskVoiceApp(App):
         top_panel.height = 80
 
         self.state_label = Label(
-            text='[ЗАГРУЗКА VOSK...]',
+            text='[ЗАГРУЗКА WHISPER...]',
             font_size='20sp', halign='center', valign='middle',
             color=(0.8, 0.8, 1, 1), size_hint=(1, None), height=30)
         self.state_label.bind(size=self.state_label.setter('text_size'))
@@ -370,7 +383,7 @@ class VoskVoiceApp(App):
         self.buttons_panel.add_widget(self.menu_box)
         self.root_box.add_widget(self.buttons_panel)
 
-        self._log(f"Грамматика: {len(json.loads(self.grammar_str))} фраз | Модель: {MODEL_PATH}")
+        self._log(f"Грамматика: {len(json.loads(self.grammar_str))} фраз | Модель: Whisper {WHISPER_MODEL_SIZE}")
 
         Clock.schedule_interval(self._update_gui, 0.10)
         return self.root_box
@@ -455,10 +468,20 @@ class VoskVoiceApp(App):
 
     # ── Загрузка модели ─────────────────────────────────────────
     def _load_model(self):
-        self._log(f"Загрузка VOSK из {MODEL_PATH}...")
+        # Vosk — только для wake word "протез" (стриминговый, надёжный)
+        self._log(f"Загрузка VOSK (wake word) из {MODEL_PATH}...")
         t0 = time.time()
-        self.model = vosk.Model(MODEL_PATH)
+        self.vosk_model = vosk.Model(MODEL_PATH)
         self._log(f"VOSK загружен за {time.time() - t0:.1f}s")
+
+        # Whisper — транскрипция команд (законченная фраза)
+        self._log(f"Загрузка Whisper {WHISPER_MODEL_SIZE} ({WHISPER_DEVICE}/{WHISPER_COMPUTE_TYPE})...")
+        t0 = time.time()
+        self.whisper_model = WhisperModel(
+            WHISPER_MODEL_SIZE, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE,
+            cpu_threads=WHISPER_CPU_THREADS
+        )
+        self._log(f"Whisper загружен за {time.time() - t0:.1f}s")
         self.state = State.LISTENING
 
     # ── Захват аудио ────────────────────────────────────────────
@@ -471,7 +494,7 @@ class VoskVoiceApp(App):
                 data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
                 with self.buffer_lock:
                     self.audio_buffer.append(data)
-                    max_chunks = int(SAMPLE_RATE / CHUNK_SIZE * CHUNK_DURATION * 2)
+                    max_chunks = int(SAMPLE_RATE / CHUNK_SIZE * CHUNK_DURATION * 4)
                     while len(self.audio_buffer) > max_chunks:
                         self.audio_buffer.popleft()
                     if self.state == State.CAPTURING:
@@ -482,9 +505,9 @@ class VoskVoiceApp(App):
         stream.stop_stream()
         stream.close()
 
-    # ── VOSK worker ──────────────────────────────────────────────
-    def _vosk_worker(self):
-        while self.model is None and self.running:
+    # ── Whisper worker ───────────────────────────────────────────
+    def _whisper_worker(self):
+        while (self.vosk_model is None or self.whisper_model is None) and self.running:
             time.sleep(0.1)
 
         while self.running:
@@ -495,11 +518,11 @@ class VoskVoiceApp(App):
             time.sleep(CHUNK_DURATION)
 
             if self.state == State.LISTENING:
-                self._vosk_listening_cycle()
+                self._whisper_listening_cycle()
             elif self.state == State.CAPTURING:
                 self._vosk_capturing_check()
 
-    def _vosk_listening_cycle(self):
+    def _whisper_listening_cycle(self):
         with self.buffer_lock:
             if len(self.audio_buffer) < int(SAMPLE_RATE / CHUNK_SIZE * 0.5):
                 return
@@ -509,6 +532,7 @@ class VoskVoiceApp(App):
         if not has_speech(audio):
             return
 
+        # Wake word детектит стриминговый Vosk (надёжно в потоке)
         text = self._vosk_transcribe_freeform(audio)
         if not text:
             return
@@ -523,6 +547,21 @@ class VoskVoiceApp(App):
             with self.buffer_lock:
                 self.audio_buffer.clear()
 
+    def _vosk_transcribe_freeform(self, audio: np.ndarray) -> str:
+        """Стриминговая транскрипция Vosk для детекции ключевого слова."""
+        if len(audio) < SAMPLE_RATE * 0.15:
+            return ""
+        try:
+            rec = vosk.KaldiRecognizer(self.vosk_model, SAMPLE_RATE)
+            rec.SetWords(True)
+            audio_int16 = (audio * 32768.0).astype(np.int16)
+            rec.AcceptWaveform(audio_int16.tobytes())
+            result = json.loads(rec.FinalResult())
+            return result.get("text", "").strip()
+        except Exception as e:
+            self._log(f"VOSK error: {e}")
+            return ""
+
     def _vosk_capturing_check(self):
         elapsed = time.time() - self.capture_start
         chunk_audio = self._frames_to_audio(self.captured_frames)
@@ -532,28 +571,33 @@ class VoskVoiceApp(App):
             self.state = State.PROCESSING
             self.result_queue.put(("process", chunk_audio))
 
-    # ── VOSK: свободное распознавание (wake word) ────────────────
-    def _vosk_transcribe_freeform(self, audio: np.ndarray) -> str:
-        """Без грамматики — для детекции ключевого слова."""
+    # ── Whisper: транскрипция ────────────────────────────────────
+    def _whisper_transcribe(self, audio: np.ndarray) -> str:
+        """Транскрипция аудио через faster-whisper (с VAD и без галлюцинаций)."""
         if len(audio) < SAMPLE_RATE * 0.15:
             return ""
         try:
-            rec = vosk.KaldiRecognizer(self.model, SAMPLE_RATE)
-            rec.SetWords(True)
-
-            audio_int16 = (audio * 32768.0).astype(np.int16)
-            rec.AcceptWaveform(audio_int16.tobytes())
-
-            result = json.loads(rec.FinalResult())
-            return result.get("text", "").strip()
+            segments, _ = self.whisper_model.transcribe(
+                audio,
+                language="ru",
+                beam_size=1,
+                temperature=0,
+                vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=400,
+                    speech_pad_ms=200,
+                ),
+                condition_on_previous_text=False,  # иначе Whisper галлюцинирует на шуме
+            )
+            return " ".join(s.text for s in segments).strip()
         except Exception as e:
-            self._log(f"VOSK error: {e}")
+            self._log(f"Whisper error: {e}")
             return ""
 
-    # ── VOSK: свободное + fuzzy match против grammar.json ────────
-    def _vosk_transcribe_packet(self, audio: np.ndarray) -> str:
-        """Свободная транскрипция + поиск лучшего совпадения в grammar.json."""
-        raw = self._vosk_transcribe_freeform(audio)
+    # ── Whisper: свободное + fuzzy match против grammar.json ─────
+    def _whisper_transcribe_packet(self, audio: np.ndarray) -> str:
+        """Транскрипция + поиск лучшего совпадения в grammar.json."""
+        raw = self._whisper_transcribe(audio)
         if not raw:
             return ""
 
@@ -728,16 +772,21 @@ class VoskVoiceApp(App):
             while True:
                 msg_type, data = self.result_queue.get_nowait()
                 if msg_type == "process":
-                    self._handle_process(data)
+                    self.partial_label.text = ""
+                    threading.Thread(target=self._handle_process, args=(data,), daemon=True).start()
                 elif msg_type == "partial":
                     self.partial_label.text = data
+                elif msg_type == "response":
+                    text, color = data
+                    self.response_label.text = text
+                    self.response_label.color = color
                 elif msg_type == "log":
                     self._append_log(data)
         except queue.Empty:
             pass
 
         if self.state == State.LOADING:
-            self.state_label.text = "[ЗАГРУЗКА VOSK...]"
+            self.state_label.text = "[ЗАГРУЗКА WHISPER...]"
         elif self.state == State.LISTENING:
             self.state_label.text = "[СЛУШАЮ] Ожидание ключевого слова..."
             self.state_label.color = (0.6, 0.8, 1, 1)
@@ -751,26 +800,23 @@ class VoskVoiceApp(App):
 
     def _handle_process(self, audio: np.ndarray):
         t_start = time.time()
-        text = self._vosk_transcribe_packet(audio)
+        text = self._whisper_transcribe_packet(audio)
         self._log(f"[ПАКЕТ] {text}")
-        self.partial_label.text = ""
 
         parsed = self._parse_packet(text)
 
         if parsed is None:
             self._log(f"[!] KEYWORD '{KEYWORD}' not found: '{text}'")
-            self.response_label.text = "Ошибка: пакет не распознан"
-            self.response_label.color = (1, 0.3, 0.3, 1)
+            self.result_queue.put(("response", ("Ошибка: пакет не распознан", (1, 0.3, 0.3, 1))))
         else:
             result = self._execute(parsed)
             elapsed_ms = (time.time() - t_start) * 1000
             self._log(f"[ОТВЕТ] {result}")
             self._log(f"[ТАЙМЕР] Обработка команды: {elapsed_ms:.0f} мс")
-            self.response_label.text = result
             if "Не распознан" in result or "Неизвестная" in result:
-                self.response_label.color = (1, 0.5, 0.2, 1)
+                self.result_queue.put(("response", (result, (1, 0.5, 0.2, 1))))
             else:
-                self.response_label.color = (0.3, 1, 0.3, 1)
+                self.result_queue.put(("response", (result, (0.3, 1, 0.3, 1))))
 
         self.state = State.LISTENING
         self.captured_frames = []

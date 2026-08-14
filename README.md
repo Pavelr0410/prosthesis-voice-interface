@@ -121,3 +121,59 @@ V-ОК-01	Валидная команда (общий тест)
 V-НЕ-01	Негативный пример
 W-AC-01	Шумная команда (акустический тест)
 W-PR-01	Шумная или реверберирующая команда (сложный тест)
+
+---
+
+## 🎙 Голосовые приложения (Kivy)
+
+Два Kivy-приложения управляют протезом Fest голосом и кнопками:
+
+| Файл | Движок распознавания |
+|---|---|
+| `transcription_app_vosk.py` | Vosk (стриминговый) |
+| `transcription_app_whisper.py` | Whisper-small (faster-whisper) для команд + Vosk для wake word |
+
+### 🔧 Зависимости
+
+Ставятся вручную (в репозиторий не входят):
+
+**Общие:**
+```bash
+pip install kivy numpy pyaudio webrtcvad
+# Windows: webrtcvad часто требует готовый билд
+pip install webrtcvad-wheels
+```
+
+**Для `transcription_app_vosk.py` (Vosk):**
+```bash
+pip install vosk
+```
+Нужна модель Vosk в папке `model-ru/` (см. «Установка модели Vosk» выше).
+
+**Для `transcription_app_whisper.py` (Whisper):**
+```bash
+pip install vosk faster-whisper
+```
+- `vosk` — только для детекции wake word «протез» (нужна та же `model-ru/`);
+- `faster-whisper` — при первом запуске скачает модель `Systran/faster-whisper-tiny` (~75 МБ) в кэш HuggingFace.
+
+**Протез (управление железом):**
+```bash
+# Внешняя библиотека MotoricaInterface (в репозиторий НЕ добавляется)
+pip install -e "путь_к/pyMotoricaInterface" --no-build-isolation
+pip install bleak pyserial
+```
+
+### 🚀 Как пользоваться
+
+1. Запусти приложение:
+   ```bash
+   python transcription_app_vosk.py        # или transcription_app_whisper.py
+   ```
+2. Подключение к протезу:
+   - **USB UART**: при старте приложение само подключается к `COM3`;
+   - **BLE**: нажми «BLE Connect» (кнопка-переключатель: повторное нажатие отключает).
+3. Голосовая команда: скажи **«протез жест кулак выполняй»** (поддерживаются жесты: кулак, открыть, нейтральный, указательный, щипок, большой палец, коза и др.). При старте записи дождись тишины — команда распознается и выполнится.
+4. Ручное управление: нажми «Manual control» → появятся кнопки жестов («Открыть»…«Коза») и «Назад» (возврат в меню).
+
+> ⚠️ Через BLE команды уходят в характеристику `4368000a` (MOVE_ALL_FINGERS) протеза Fest; через serial — в регистр `0xBB`. Для работы нужен протез Fest.
