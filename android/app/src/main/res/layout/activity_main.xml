@@ -41,18 +41,6 @@
         android:layout_marginBottom="8dp" />
 
     <Button
-        android:id="@+id/timerButton"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Старт таймера"
-        android:textSize="16sp"
-        android:textColor="#FFFFFF"
-        android:backgroundTint="#2196F3"
-        android:padding="10dp"
-        android:layout_marginTop="4dp"
-        android:layout_marginBottom="4dp"/>
-
-    <Button
         android:id="@+id/serviceToggleButton"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

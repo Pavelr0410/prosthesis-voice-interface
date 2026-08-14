@@ -48,7 +48,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         private const val MATCH_THRESHOLD = 0.85
         private const val KEYWORD = "протез"
         private const val KEYWORD_MATCH_THRESHOLD = 0.6
-        private const val RESET_TIMEOUT = 3000L
         private const val SCAN_ATTEMPTS = 3
         private const val SCAN_DURATION_MS = 12000L
     }
@@ -64,11 +63,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     private val grammarList = mutableListOf<String>()
     private val whitelistWords = mutableSetOf<String>()
 
-    private var buttonTimerStart = 0L
-    private var isTimerRunning = false
-    private var lastSpeechTime = 0L
-    private var resetRunnable: Runnable? = null
-
     private var isServiceRunning = false
 
     private lateinit var bluetoothManager: BluetoothModbusManager
@@ -82,7 +76,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     private lateinit var responseLabel: TextView
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
-    private lateinit var timerButton: Button
     private lateinit var serviceToggleButton: Button
     private lateinit var btConnectButton: Button
 
@@ -126,17 +119,12 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         responseLabel = findViewById(R.id.responseLabel)
         logText = findViewById(R.id.logText)
         logScroll = findViewById(R.id.logScroll)
-        timerButton = findViewById(R.id.timerButton)
         serviceToggleButton = findViewById(R.id.serviceToggleButton)
         btConnectButton = findViewById(R.id.btConnectButton)
 
         bluetoothManager = BluetoothModbusManager(this)
         bluetoothManager.onError = { msg ->
             runOnUiThread { log("[BLUETOOTH] ❌ $msg") }
-        }
-
-        timerButton.setOnClickListener {
-            startTimer()
         }
 
         serviceToggleButton.setOnClickListener {
@@ -593,7 +581,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         speechService?.stop()
         speechService?.shutdown()
         model?.close()
-        resetTimer()
         bluetoothManager.stopDiscovery()
         bluetoothManager.stopBleScan()
         bluetoothManager.disconnect()
@@ -737,52 +724,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         log("[СЕРВИС] Фоновый режим остановлен")
     }
 
-    private fun startTimer() {
-        resetTimer()
-        buttonTimerStart = System.currentTimeMillis()
-        isTimerRunning = true
-        lastSpeechTime = System.currentTimeMillis()
-
-        timerButton.text = "Таймер запущен..."
-        timerButton.setBackgroundColor(0xFF4CAF50.toInt())
-
-        log("[ТАЙМЕР] Запущен")
-        scheduleReset()
-    }
-
-    private fun resetTimer() {
-        isTimerRunning = false
-        buttonTimerStart = 0L
-        lastSpeechTime = 0L
-
-        resetRunnable?.let { handler.removeCallbacks(it) }
-        resetRunnable = null
-
-        timerButton.text = "Старт таймера"
-        timerButton.setBackgroundColor(0xFF2196F3.toInt())
-
-        log("[ТАЙМЕР] Сброшен")
-    }
-
-    private fun scheduleReset() {
-        resetRunnable?.let { handler.removeCallbacks(it) }
-        resetRunnable = Runnable {
-            if (isTimerRunning && System.currentTimeMillis() - lastSpeechTime >= RESET_TIMEOUT) {
-                log("[ТАЙМЕР] Сброс по таймауту (${RESET_TIMEOUT}ms без речи)")
-                resetTimer()
-            }
-        }
-        handler.postDelayed(resetRunnable!!, RESET_TIMEOUT)
-    }
-
-    private fun getDuration(): Long {
-        return if (isTimerRunning && buttonTimerStart > 0) {
-            System.currentTimeMillis() - buttonTimerStart
-        } else {
-            0L
-        }
-    }
-
     override fun onPartialResult(hypothesis: String?) {
         hypothesis ?: return
         val text = extractText(hypothesis)
@@ -790,27 +731,12 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         lastPartial = text
         lastPartialTime = System.currentTimeMillis()
 
-        if (isTimerRunning) {
-            lastSpeechTime = System.currentTimeMillis()
-            scheduleReset()
-        }
-
         when (state) {
             State.LISTENING -> {
-                if (isTimerRunning) {
-                    val duration = getDuration()
-                    log("[СЛУШАЮ] $text (${duration}ms)")
-                    if (matchesKeyword(text)) {
-                        log("*** КЛЮЧЕВОЕ СЛОВО: '$KEYWORD' *** (${duration}ms)")
-                        resetTimer()
-                        onWakeWordDetected()
-                    }
-                } else {
-                    log("[СЛУШАЮ] $text")
-                    if (matchesKeyword(text)) {
-                        log("*** КЛЮЧЕВОЕ СЛОВО: '$KEYWORD' ***")
-                        onWakeWordDetected()
-                    }
+                log("[СЛУШАЮ] $text")
+                if (matchesKeyword(text)) {
+                    log("*** КЛЮЧЕВОЕ СЛОВО: '$KEYWORD' ***")
+                    onWakeWordDetected()
                 }
             }
             State.CAPTURING -> {
@@ -839,18 +765,8 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
 
         when (state) {
             State.LISTENING -> {
-                if (isTimerRunning) {
-                    val duration = getDuration()
-                    log("[ФИНАЛ] $text (${duration}ms)")
-                    if (matchesKeyword(text)) {
-                        log("*** КЛЮЧЕВОЕ СЛОВО: '$KEYWORD' *** (${duration}ms)")
-                        resetTimer()
-                        onWakeWordDetected()
-                    }
-                } else {
-                    if (matchesKeyword(text)) {
-                        onWakeWordDetected()
-                    }
+                if (matchesKeyword(text)) {
+                    onWakeWordDetected()
                 }
             }
             State.CAPTURING -> {
@@ -938,6 +854,9 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     }
 
     private fun processCommand() {
+        // Старт задержки — момент последней частичной транскрипции
+        // (пользователь закончил говорить); замер = конец речи → выполнение жеста.
+        val tStart = lastPartialTime
         val raw = capturedText.toString().trim()
         state = State.PROCESSING
         updateStateUI()
@@ -982,7 +901,9 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
             responseLabel.setTextColor(0xFFFF4444.toInt())
         } else {
             val result = execute(parsed, raw)
+            val elapsedMs = System.currentTimeMillis() - tStart
             log("[ОТВЕТ] $result")
+            log("[ТАЙМЕР] Обработка команды: $elapsedMs мс")
             responseLabel.text = result
             responseLabel.setTextColor(
                 if (result.contains("Не распознан") || result.contains("Неизвестная"))

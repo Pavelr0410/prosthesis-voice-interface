@@ -182,9 +182,10 @@ pip install bleak pyserial
 
 | Движок / модель | Средняя задержка | Среднее число попыток |
 |---|---|---|
-| Vosk-small | 1901 мс | 1–2 |
-| Whisper-tiny | 1041 мс | 3–4 |
-| Whisper-base | 2044 мс | 1–2 |
-| Whisper-small | 5791 мс | 1–2 |
+| Vosk-small (Python) | 1901 мс | 1–2 |
+| Whisper-tiny (Python) | 1041 мс | 3–4 |
+| Whisper-base (Python) | 2044 мс | 1–2 |
+| Whisper-small (Python) | 5791 мс | 1–2 |
+| Vosk-small (Android) | 1169 мс | 1 |
 
 > Замеры end-to-end на CPU: от захвата команды до выполнения жеста. Число попыток — сколько раз нужно повторить команду, чтобы она распозналась.
