@@ -18,6 +18,7 @@ import os
 import re
 import time
 import json
+import wave
 import asyncio
 import threading
 import collections
@@ -260,6 +261,7 @@ class VoskVoiceApp(App):
 
         self.log_lines = []
         self.running = True
+        self._samples_busy = False
 
         os.makedirs(LOG_DIR, exist_ok=True)
         self._log_path = os.path.join(LOG_DIR, datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".log")
@@ -350,6 +352,12 @@ class VoskVoiceApp(App):
             background_color=(0.25, 0.45, 0.7, 1))
         manual_button.bind(on_press=self._on_manual_control)
         self.menu_box.add_widget(manual_button)
+
+        self.samples_button = Button(
+            text='Run samples', font_size='16sp', size_hint_y=None, height=52,
+            background_color=(0.55, 0.35, 0.65, 1))
+        self.samples_button.bind(on_press=self._on_run_samples)
+        self.menu_box.add_widget(self.samples_button)
         self.menu_box.add_widget(Widget())  # растягивается вниз
 
         # ── Группа «команды»: жесты сверху, «Назад» внизу (скрыта по умолчанию) ──
@@ -387,6 +395,181 @@ class VoskVoiceApp(App):
     def _on_back(self, instance):
         self.buttons_panel.remove_widget(self.cmd_box)
         self.buttons_panel.add_widget(self.menu_box)
+
+    # ── Run samples: прогон аудио по всем папкам samples ────────
+    SAMPLE_FOLDERS = [
+        "clean/commands", "clean/edge", "clean/status",
+        "negative/malformed", "noisy/machinery", "noisy/office",
+        "noisy/reverb", "noisy/street",
+    ]
+
+    def _on_run_samples(self, instance):
+        if self._samples_busy:
+            self._log("[SAMPLES] Обработка уже идёт...")
+            return
+        self._samples_busy = True
+        self._set_samples_button_state(True)
+        self._log("[SAMPLES] Микрофон отключён, запуск обработки сэмплов...")
+        threading.Thread(target=self._run_samples, daemon=True).start()
+
+    def _set_samples_button_state(self, busy):
+        def _apply(dt):
+            self.samples_button.text = "Обработка..." if busy else "Run samples"
+            self.samples_button.background_color = (0.4, 0.4, 0.4, 1) if busy else (0.55, 0.35, 0.65, 1)
+            self.samples_button.disabled = busy
+        Clock.schedule_once(_apply)
+
+    def _run_samples(self):
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+            samples_dir = os.path.join(base, "samples")
+            manifest_path = os.path.join(base, "manifest.json")
+            out_path = os.path.join(samples_dir, "Results_Vosk.txt")
+
+            # manifest.json: path -> (text, expected_command)
+            expected = {}
+            try:
+                with open(manifest_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                items = data.get("samples", data) if isinstance(data, dict) else data
+                for s in items:
+                    p = s.get("path", "").replace("\\", "/")
+                    if p:
+                        expected[p] = (s.get("text", ""), s.get("expected_command", ""))
+            except Exception as e:
+                self._log(f"[SAMPLES] Ошибка чтения manifest.json: {e}")
+                return
+
+            all_lines = []
+            folder_summary = []
+
+            for folder in self.SAMPLE_FOLDERS:
+                folder_abs = os.path.join(samples_dir, folder)
+                if not os.path.isdir(folder_abs):
+                    self._log(f"[SAMPLES] Папка не найдена: {folder}, пропуск")
+                    continue
+
+                rows = []
+                total_ok = 0
+                total_ms = 0.0
+                count = 0
+                files = sorted(f for f in os.listdir(folder_abs) if f.lower().endswith(".wav"))
+
+                for fname in files:
+                    rel = folder + "/" + fname
+                    info = expected.get(rel)
+                    if info is None:
+                        self._log(f"[SAMPLES] Нет записи в manifest для {rel}, пропуск")
+                        continue
+                    correct, expected_cmd = info
+
+                    audio = self._read_wav(os.path.join(folder_abs, fname))
+                    if audio is None or len(audio) == 0:
+                        continue
+
+                    t0 = time.time()
+                    recognized, match_score, _ = self._transcribe_audio_batch(audio)
+                    elapsed_ms = (time.time() - t0) * 1000
+
+                    status = self._sample_status(recognized, correct, expected_cmd)
+                    if status == "выполнен":
+                        total_ok += 1
+                    payload = self._executed_payload(recognized)
+                    rows.append((correct, recognized, payload, match_score * 100, elapsed_ms, status))
+                    total_ms += elapsed_ms
+                    count += 1
+
+                if count == 0:
+                    self._log(f"[SAMPLES] {folder}: файлов не обработано")
+                    continue
+
+                pct = total_ok / count * 100
+                avg_ms = total_ms / count
+                folder_summary.append((folder, total_ok, count, pct, avg_ms))
+
+                all_lines.append(f"## samples/{folder}")
+                all_lines.append("| Правильный Результат | Результат Vosk | Команда (payload) | Соответствие в % | Задержка (мс) | Статус |")
+                all_lines.append("|---|---|---|---|---|---|")
+                for correct, recognized, payload, similarity, elapsed_ms, status in rows:
+                    all_lines.append(f"| {correct} | {recognized} | {payload} | {similarity:.1f} | {elapsed_ms:.0f} | {status} |")
+                all_lines.append("")
+
+                self._log(f"[SAMPLES] {folder}: {total_ok}/{count} ({pct:.1f}%), средняя задержка {avg_ms:.1f} мс")
+
+            all_lines.append("## Итог по папкам")
+            all_lines.append("| Папка | Правильно | Процент | Средняя задержка (мс) |")
+            all_lines.append("|---|---|---|---|")
+            for folder, ok, cnt, pct, avg_ms in folder_summary:
+                all_lines.append(f"| samples/{folder} | {ok}/{cnt} | {pct:.1f}% | {avg_ms:.1f} |")
+
+            try:
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(all_lines) + "\n")
+                self._log(f"[SAMPLES] Результаты записаны в {out_path}")
+            except Exception as e:
+                self._log(f"[SAMPLES] Ошибка записи результата: {e}")
+        finally:
+            self._samples_busy = False
+            self._set_samples_button_state(False)
+            self._log("[SAMPLES] Обработка завершена, микрофон включён")
+
+    def _executed_payload(self, recognized):
+        """Команда (payload), которую выполнила бы программа по распознанному тексту."""
+        parsed = self._parse_packet(recognized)
+        if parsed is None:
+            return self._find_gesture_in_text(recognized) or ""
+        cmd = parsed.get("command", "")
+        payload = parsed.get("payload", "")
+        if cmd in ("статус", "status"):
+            return "статус"
+        if not payload:
+            payload = self._find_gesture_in_text(recognized) or ""
+        return payload
+
+    def _sample_status(self, recognized, expected_text, expected_command):
+        if not recognized:
+            return "не выполнен"
+        if expected_command in ("статус", "status"):
+            return "выполнен" if ("статус" in recognized or "status" in recognized) else "не выполнен"
+        exp_gesture = self._find_gesture_in_text(expected_text)
+        rec_gesture = self._find_gesture_in_text(recognized)
+        return "выполнен" if (exp_gesture is not None and rec_gesture == exp_gesture) else "не выполнен"
+
+    def _read_wav(self, path):
+        try:
+            w = wave.open(path, "rb")
+            n = w.getnframes()
+            raw = w.readframes(n)
+            w.close()
+            audio_int16 = np.frombuffer(raw, dtype=np.int16)
+            return audio_int16.astype(np.float32) / 32768.0
+        except Exception as e:
+            self._log(f"[SAMPLES] Ошибка чтения {path}: {e}")
+            return None
+
+    def _transcribe_audio_batch(self, audio):
+        """Как при команде: свободная транскрипция + fuzzy match с grammar.json."""
+        raw = self._vosk_transcribe_freeform(audio)
+        if not raw:
+            return "", 0.0, ""
+        best_match, best_score = None, 0.0
+        raw_lower = raw.lower().strip()
+        for phrase in json.loads(self.grammar_str):
+            score = SequenceMatcher(None, raw_lower, phrase.lower()).ratio()
+            if score > best_score:
+                best_score = score
+                best_match = phrase
+        if best_match and best_score >= MATCH_THRESHOLD:
+            return best_match, best_score, raw
+        return raw, best_score, raw
+
+    def _find_gesture_in_text(self, text):
+        if not text:
+            return None
+        for g in GESTURES:
+            if g in text:
+                return g
+        return None
 
     def _on_ble_connect(self, instance):
         if self.ble is not None and self.ble.connected:
@@ -469,6 +652,8 @@ class VoskVoiceApp(App):
         while self.running:
             try:
                 data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                if self._samples_busy:
+                    continue
                 with self.buffer_lock:
                     self.audio_buffer.append(data)
                     max_chunks = int(SAMPLE_RATE / CHUNK_SIZE * CHUNK_DURATION * 2)
@@ -488,6 +673,10 @@ class VoskVoiceApp(App):
             time.sleep(0.1)
 
         while self.running:
+            if self._samples_busy:
+                time.sleep(0.1)
+                continue
+
             if self.state in (State.LOADING, State.PROCESSING):
                 time.sleep(0.1)
                 continue

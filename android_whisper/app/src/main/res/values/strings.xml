@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ГолосЖест</string>
+    <string name="state_loading">[ЗАГРУЗКА VOSK…]</string>
+    <string name="state_listening">[СЛУШАЮ] Ожидание ключевого слова…</string>
+    <string name="state_capturing">[ЗАПИСЬ] %.1fs / %.0fs</string>
+    <string name="state_processing">[ОБРАБОТКА…]</string>
+    <string name="help_text">Скажите \"Протез\" → дождитесь \"Говорите…\" → команда (напр. \"жест кулак выполняй\")\n\nЖесты: кулак, щипок, указательный, нейтральный, большой палец, сжатие пальцев, открыть, флексия, экстензия\nСтатус: \"протез статус выполняй\"</string>
+</resources>
