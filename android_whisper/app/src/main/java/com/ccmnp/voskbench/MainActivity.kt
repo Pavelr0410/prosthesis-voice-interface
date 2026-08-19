@@ -8,6 +8,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.location.LocationManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -23,25 +26,21 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.ccmnp.voskbench.services.VoiceRecognitionService
+import com.whispercpp.java.whisper.WhisperContext
 import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
-import org.vosk.Model
-import org.vosk.Recognizer
-import org.vosk.android.RecognitionListener
-import org.vosk.android.SpeechService
 import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.*
-import java.util.zip.ZipInputStream
 import kotlin.math.max
 
-class MainActivity : AppCompatActivity(), RecognitionListener {
+class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "VoiceControl"
-        private const val SAMPLE_RATE = 16000f
+        private const val SAMPLE_RATE = 16000
         private const val PERMISSION_RECORD = 1001
         private const val PERMISSION_BLUETOOTH = 1002
         private const val PACKET_TIMEOUT = 5000L
@@ -50,16 +49,22 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         private const val KEYWORD_MATCH_THRESHOLD = 0.6
         private const val SCAN_ATTEMPTS = 3
         private const val SCAN_DURATION_MS = 12000L
+        private const val SPEECH_THRESHOLD = 400f   // RMS-порог начала/продолжения речи
+        private const val SILENCE_MS = 900L          // тишина для завершения захвата
+        private const val WHISPER_MODEL_ASSET = "ggml-tiny-q5_1.bin"
     }
 
     private enum class State { LOADING, LISTENING, CAPTURING, PROCESSING }
 
     private var state = State.LOADING
-    private var model: Model? = null
-    private var speechService: SpeechService? = null
+    private var whisper: WhisperContext? = null
+    private var audioRecord: AudioRecord? = null
+    private var audioThread: Thread? = null
+    @Volatile private var isRecording = false
     private var captureStart = 0L
-    private val capturedText = StringBuilder()
-    private var lastPartial = ""
+    private var lastSpeechTs = 0L
+    private val capturedSamples = mutableListOf<Float>()
+    private val audioLock = Any()
     private val grammarList = mutableListOf<String>()
     private val whitelistWords = mutableSetOf<String>()
 
@@ -83,7 +88,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
 
     private val logLines = mutableListOf<String>()
     private val handler = Handler(Looper.getMainLooper())
-    private var lastPartialTime = System.currentTimeMillis()
 
     private val endSynonyms = setOf(
         "выполнять", "выполняй", "выполняйте", "выполни",
@@ -107,7 +111,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
             if (intent?.action == "KEYWORD_DETECTED") {
                 val keyword = intent.getStringExtra("keyword") ?: return
                 log("*** КЛЮЧЕВОЕ СЛОВО ИЗ СЕРВИСА: '$keyword' ***")
-                onWakeWordDetected()
             }
         }
     }
@@ -152,11 +155,11 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         // 🔥 ЗАПРАШИВАЕМ РАЗРЕШЕНИЯ
         requestPermissions()
 
-        // 🔥 ПРИНУДИТЕЛЬНО ЗАПУСКАЕМ VOSK через 2 секунды
+        // 🔥 ПРИНУДИТЕЛЬНО ЗАПУСКАЕМ WHISPER через 2 секунды
         handler.postDelayed({
-            log("⏰ Принудительный запуск VOSK через 2 секунды...")
+            log("⏰ Принудительный запуск Whisper через 2 секунды...")
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                log("✅ Разрешение на микрофон есть, запускаем VOSK")
+                log("✅ Разрешение на микрофон есть, запускаем Whisper")
                 initModel()
             } else {
                 log("❌ Нет разрешения на микрофон, запрашиваем...")
@@ -168,11 +171,9 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         handler.postDelayed(object : Runnable {
             override fun run() {
                 // Во время обработки сэмплов микрофон выключен и его не трогаем
-                if (!samplesBusy && state != State.LOADING && System.currentTimeMillis() - lastPartialTime > 10000) {
-                    log("[WATCHDOG] No partials for 10s, restarting SpeechService")
-                    try { speechService?.stop() } catch (_: Exception) {}
-                    if (model != null) startListening()
-                    lastPartialTime = System.currentTimeMillis()
+                if (!samplesBusy && state != State.LOADING && !isRecording) {
+                    log("[WATCHDOG] Захват не работает, перезапускаем")
+                    if (whisper != null) startListening()
                 }
                 handler.postDelayed(this, 5000)
             }
@@ -586,9 +587,9 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         try {
             unregisterReceiver(keywordReceiver)
         } catch (_: Exception) {}
-        speechService?.stop()
-        speechService?.shutdown()
-        model?.close()
+        stopListening()
+        try { whisper?.release() } catch (_: Exception) {}
+        whisper = null
         bluetoothManager.stopDiscovery()
         bluetoothManager.stopBleScan()
         bluetoothManager.disconnect()
@@ -633,52 +634,16 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
 
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                val modelDir = File(filesDir, "model-ru")
-                val confFile = File(modelDir, "conf/model.conf")
-
-                log("📁 Путь к модели: ${modelDir.absolutePath}")
-                log("📁 conf/model.conf существует: ${confFile.exists()}")
-
-                if (!confFile.exists()) {
-                    log("[INFO] Extracting model-ru.zip...")
-                    modelDir.deleteRecursively()
-                    modelDir.mkdirs()
-
-                    val zipBytes = assets.open("model-ru.zip").use { it.readBytes() }
-                    ZipInputStream(zipBytes.inputStream()).use { zis ->
-                        var entry = zis.nextEntry
-                        while (entry != null) {
-                            var entryName = entry.name
-                            if (entryName.startsWith("model-ru/")) {
-                                entryName = entryName.substringAfter("model-ru/")
-                            }
-                            val outFile = File(modelDir, entryName)
-                            if (entry.isDirectory) {
-                                outFile.mkdirs()
-                            } else {
-                                outFile.parentFile?.mkdirs()
-                                outFile.outputStream().use { zis.copyTo(it) }
-                            }
-                            zis.closeEntry()
-                            entry = zis.nextEntry
-                        }
-                    }
-                    val fileCount = modelDir.walkTopDown().count { it.isFile }
-                    log("[INFO] Model extracted: $fileCount files")
-                }
-
-                log("🔄 Загружаем модель VOSK...")
-                val m = Model(modelDir.absolutePath)
-                model = m
-                log("✅ МОДЕЛЬ ЗАГРУЖЕНА УСПЕШНО!")
+                log("🔄 Загружаем Whisper-tiny из assets ($WHISPER_MODEL_ASSET)...")
+                val w = WhisperContext.createContextFromAsset(assets, WHISPER_MODEL_ASSET)
+                whisper = w
+                log("✅ МОДЕЛЬ WHISPER ЗАГРУЖЕНА УСПЕШНО!")
 
                 loadGrammar()
-                log("[INFO] VOSK загружен")
 
                 withContext(Dispatchers.Main) {
-                    log("📢 Запускаем startListening()...")
+                    log("📢 Запускаем прослушивание...")
                     startListening()
-                    log("✅ startListening() вызван в initModel()")
                 }
             } catch (e: Exception) {
                 log("[ERROR] Model load failed: ${e.message}")
@@ -732,140 +697,140 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         log("[СЕРВИС] Фоновый режим остановлен")
     }
 
-    override fun onPartialResult(hypothesis: String?) {
-        hypothesis ?: return
-        val text = extractText(hypothesis)
-        if (text.isBlank() || text == lastPartial) return
-        lastPartial = text
-        lastPartialTime = System.currentTimeMillis()
-
-        when (state) {
-            State.LISTENING -> {
-                log("[СЛУШАЮ] $text")
-                if (matchesKeyword(text)) {
-                    log("*** КЛЮЧЕВОЕ СЛОВО: '$KEYWORD' ***")
-                    onWakeWordDetected()
-                }
-            }
-            State.CAPTURING -> {
-                partialLabel.text = text
-                capturedText.clear()
-                capturedText.append(text)
-            }
-            else -> {}
-        }
-    }
-
-    override fun onResult(hypothesis: String?) {
-        hypothesis ?: return
-        val text = extractText(hypothesis)
-        if (text.isBlank()) return
-        if (state == State.CAPTURING) {
-            capturedText.clear()
-            capturedText.append(text)
-        }
-    }
-
-    override fun onFinalResult(hypothesis: String?) {
-        hypothesis ?: return
-        val text = extractText(hypothesis)
-        if (text.isBlank()) return
-
-        when (state) {
-            State.LISTENING -> {
-                if (matchesKeyword(text)) {
-                    onWakeWordDetected()
-                }
-            }
-            State.CAPTURING -> {
-                capturedText.append(" ").append(text)
-            }
-            else -> {}
-        }
-    }
-
-    override fun onError(e: Exception?) {
-        log("[ERROR] VOSK: ${e?.message}")
-        if (state == State.LISTENING || state == State.CAPTURING) {
-            handler.postDelayed({
-                try {
-                    speechService?.stop()
-                    startListening()
-                    log("[INFO] SpeechService restarted after error")
-                } catch (ex: Exception) {
-                    log("[ERROR] Restart failed: ${ex.message}")
-                }
-            }, 1000)
-        }
-    }
-
-    override fun onTimeout() {
-        if (state == State.CAPTURING && capturedText.isNotBlank()) {
-            state = State.PROCESSING
-            updateStateUI()
-            processCommand()
-        }
-    }
-
+    // ── Whisper: захват аудио + VAD ─────────────────────────────
     private fun startListening() {
-        //log("========== startListening() ВЫЗВАН ==========")
         state = State.LISTENING
         updateStateUI()
-        log("[INFO] SpeechService started (mic listening)")
-
-        try {
-            if (model == null) {
-                log("❌ model == null! Не могу запустить SpeechService")
-                return
-            }
-
-            //log("🔄 Создаем Recognizer...")
-            val recognizer = Recognizer(model, SAMPLE_RATE)
-            //log("✅ Recognizer создан")
-
-            //log("🔄 Создаем SpeechService...")
-            speechService = SpeechService(recognizer, SAMPLE_RATE)
-            //log("✅ SpeechService создан")
-
-            //log("🔄 Запускаем SpeechService...")
-            speechService?.startListening(this)
-            //log("✅ SpeechService успешно запущен")
-
-            // Принудительно обновляем UI
-            handler.post {
-                stateLabel.text = "[СЛУШАЮ] Ожидание ключевого слова..."
-                stateLabel.setTextColor(0xFF8099CC.toInt())
-            }
-        } catch (e: Exception) {
-            log("❌ Ошибка запуска SpeechService: ${e.message}")
-            e.printStackTrace()
+        log("[INFO] Whisper: слушаю микрофон...")
+        if (whisper == null) {
+            log("❌ Whisper модель не загружена")
+            return
+        }
+        if (audioThread == null || !audioThread!!.isAlive) {
+            isRecording = true
+            audioThread = Thread { audioLoop() }
+            audioThread!!.start()
         }
     }
 
-    private fun onWakeWordDetected() {
-        log("*** КЛЮЧЕВОЕ СЛОВО: '$KEYWORD' ***")
-        state = State.CAPTURING
-        captureStart = System.currentTimeMillis()
-        capturedText.clear()
-        lastPartial = ""
-        responseLabel.text = "Говорите..."
-        responseLabel.setTextColor(0xFFFFAA33.toInt())
-        updateStateUI()
-
-        handler.postDelayed({
-            if (state == State.CAPTURING) {
-                state = State.PROCESSING
-                updateStateUI()
-                processCommand()
-            }
-        }, PACKET_TIMEOUT)
+    private fun stopListening() {
+        isRecording = false
+        try { audioThread?.join(500) } catch (_: Exception) {}
+        audioThread = null
+        try { audioRecord?.stop() } catch (_: Exception) {}
+        audioRecord?.release()
+        audioRecord = null
     }
 
-    private fun processCommand() {
-        // Старт задержки — момент последней частичной транскрипции
-        // (пользователь закончил говорить); замер = конец речи → выполнение жеста.
-        val tStart = lastPartialTime
-        val raw = capturedText.toString().trim()
+    private fun audioLoop() {
+        val minBuf = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val rec = AudioRecord(
+            MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf)
+        audioRecord = rec
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            log("[ERROR] AudioRecord не инициализирован")
+            return
+        }
+        rec.startRecording()
+        val buf = ShortArray(1024)
+        while (isRecording) {
+            val n = rec.read(buf, 0, buf.size)
+            if (n > 0) {
+                val rms = computeRms(buf, n)
+                handleAudioFrame(buf.copyOf(n), rms)
+            }
+        }
+        try { rec.stop() } catch (_: Exception) {}
+        rec.release()
+        audioRecord = null
+    }
+
+    private fun computeRms(samples: ShortArray, n: Int): Float {
+        var sum = 0.0
+        for (i in 0 until n) sum += samples[i].toDouble() * samples[i].toDouble()
+        return Math.sqrt(sum / n).toFloat()
+    }
+
+    private fun handleAudioFrame(samples: ShortArray, rms: Float) {
+        when (state) {
+            State.LISTENING -> {
+                if (rms > SPEECH_THRESHOLD) {
+                    synchronized(audioLock) {
+                        capturedSamples.clear()
+                        for (s in samples) capturedSamples.add(s / 32768f)
+                    }
+                    lastSpeechTs = System.currentTimeMillis()
+                    captureStart = System.currentTimeMillis()
+                    state = State.CAPTURING
+                    runOnUiThread {
+                        responseLabel.text = "Говорите..."
+                        responseLabel.setTextColor(0xFFFFAA33.toInt())
+                        updateStateUI()
+                    }
+                }
+            }
+            State.CAPTURING -> {
+                synchronized(audioLock) {
+                    for (s in samples) capturedSamples.add(s / 32768f)
+                }
+                if (rms > SPEECH_THRESHOLD) {
+                    lastSpeechTs = System.currentTimeMillis()
+                }
+                val elapsed = System.currentTimeMillis() - captureStart
+                val silence = System.currentTimeMillis() - lastSpeechTs
+                if ((elapsed >= 500 && silence >= SILENCE_MS) || elapsed >= PACKET_TIMEOUT) {
+                    val size = synchronized(audioLock) { capturedSamples.size }
+                    if (size > SAMPLE_RATE / 4) {
+                        finishCapture()
+                    } else {
+                        synchronized(audioLock) { capturedSamples.clear() }
+                        state = State.LISTENING
+                        runOnUiThread { updateStateUI() }
+                    }
+                }
+            }
+            else -> {}
+        }
+    }
+
+    private fun finishCapture() {
+        val samples = synchronized(audioLock) { capturedSamples.toFloatArray() }
+        capturedSamples.clear()
+        state = State.PROCESSING
+        runOnUiThread { updateStateUI() }
+        val tStart = lastSpeechTs
+        Thread {
+            try {
+                val text = transcribe(samples)
+                runOnUiThread { processCommand(text, tStart) }
+            } catch (e: Exception) {
+                log("[ERROR] Whisper: ${e.message}")
+                runOnUiThread {
+                    state = State.LISTENING
+                    updateStateUI()
+                }
+            }
+        }.start()
+    }
+
+    private fun transcribe(samples: FloatArray): String {
+        val w = whisper ?: return ""
+        return try {
+            val t0 = System.currentTimeMillis()
+            val text = w.transcribeDataWithTime(samples).joinToString(" ") { it.sentence }
+            val elapsed = System.currentTimeMillis() - t0
+            log("[WHISPER] транскрипция ${elapsed} мс, сэмплов=${samples.size} (${"%.1f".format(samples.size / 16000.0)}с)")
+            text
+        } catch (e: Exception) {
+            log("[ERROR] Whisper: ${e.message}")
+            ""
+        }
+    }
+
+    private fun processCommand(text: String, tStart: Long) {
+        val raw = text.trim()
         state = State.PROCESSING
         updateStateUI()
 
@@ -1060,7 +1025,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         }
     }
 
-    // ── Run samples: прогон аудио из папки приложения ──────────
+    // ── Run samples: прогон аудио из папки приложения (Whisper) ──
     private val sampleFolders = listOf(
         "clean/commands", "clean/edge", "clean/status",
         "negative/malformed", "noisy/machinery", "noisy/office",
@@ -1074,10 +1039,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         }
         samplesBusy = true
         log("[SAMPLES] Остановка микрофона...")
-        try {
-            speechService?.stop()
-            speechService?.shutdown()
-        } catch (_: Exception) {}
+        stopListening()
         runOnUiThread {
             runSamplesButton.text = "Обработка..."
             runSamplesButton.setBackgroundColor(0xFF666666.toInt())
@@ -1099,7 +1061,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     private fun runSamples() {
         val samplesDir = File(getExternalFilesDir(null), "samples")
         val manifestFile = File(samplesDir, "manifest.json")
-        val outFile = File(samplesDir, "Results_Vosk.txt")
+        val outFile = File(samplesDir, "Results_Whisper.txt")
 
         val expected = mutableMapOf<String, Pair<String, String>>()
         try {
@@ -1167,7 +1129,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
             grandMs += totalMs
 
             sb.append("## samples/$folder\n")
-            sb.append("| Правильный Результат | Результат Vosk | Команда (payload) | Соответствие в % | Задержка (мс) | Статус |\n")
+            sb.append("| Правильный Результат | Результат Whisper | Команда (payload) | Соответствие в % | Задержка (мс) | Статус |\n")
             sb.append("|---|---|---|---|---|---|\n")
             rows.forEach { sb.append(it).append("\n") }
             sb.append("\n")
@@ -1194,7 +1156,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         }
     }
 
-    private fun readWavPcm(path: String): ByteArray? {
+    private fun readWavToFloat(path: String): FloatArray? {
         return try {
             val bytes = File(path).readBytes()
             var dataIdx = -1
@@ -1210,7 +1172,16 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
             if (dataIdx < 0) return null
             val dataStart = dataIdx + 8
             if (dataStart >= bytes.size) return null
-            bytes.copyOfRange(dataStart, bytes.size)
+            val pcm = bytes.copyOfRange(dataStart, bytes.size)
+            val n = pcm.size / 2
+            val out = FloatArray(n)
+            for (k in 0 until n) {
+                val lo = pcm[k * 2].toInt() and 0xFF
+                val hi = pcm[k * 2 + 1].toInt() shl 8
+                val s = hi or lo
+                out[k] = s / 32768f
+            }
+            out
         } catch (e: Exception) {
             log("[SAMPLES] Ошибка чтения WAV: ${e.message}")
             null
@@ -1218,16 +1189,12 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     }
 
     private fun transcribeWav(path: String): String {
-        val m = model ?: return ""
-        val pcm = readWavPcm(path) ?: return ""
+        val w = whisper ?: return ""
+        val samples = readWavToFloat(path) ?: return ""
         return try {
-            val rec = Recognizer(m, 16000f)
-            rec.acceptWaveForm(pcm, pcm.size)
-            val text = JSONObject(rec.finalResult).optString("text", "").trim()
-            rec.close()
-            text
+            w.transcribeDataWithTime(samples).joinToString(" ") { it.sentence }
         } catch (e: Exception) {
-            log("[SAMPLES] Vosk err: ${e.message}")
+            log("[SAMPLES] Whisper err: ${e.message}")
             ""
         }
     }
@@ -1282,7 +1249,7 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     private fun updateStateUI() {
         runOnUiThread {
             stateLabel.text = when (state) {
-                State.LOADING -> "[ЗАГРУЗКА VOSK...]"
+                State.LOADING -> "[ЗАГРУЗКА WHISPER...]"
                 State.LISTENING -> "[СЛУШАЮ] Ожидание ключевого слова..."
                 State.CAPTURING -> {
                     val elapsed = (System.currentTimeMillis() - captureStart) / 1000.0
@@ -1313,26 +1280,13 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
         }
     }
 
-    private fun extractText(hypothesis: String): String {
-        return try {
-            JSONObject(hypothesis).optString("partial",
-                JSONObject(hypothesis).optString("text", "")
-            ).trim()
-        } catch (e: Exception) {
-            ""
-        }
-    }
-
     override fun onResume() {
         super.onResume()
-        if (model != null && (speechService == null || state != State.LOADING)) {
+        if (whisper != null && !isRecording) {
             handler.postDelayed({
-                if (state == State.LISTENING || state == State.CAPTURING) {
-                    try {
-                        speechService?.stop()
-                    } catch (_: Exception) {}
+                if (state == State.LISTENING || state == State.CAPTURING || state == State.PROCESSING) {
                     startListening()
-                    log("[INFO] SpeechService resumed")
+                    log("[INFO] Прослушивание возобновлено")
                 }
             }, 500)
         }

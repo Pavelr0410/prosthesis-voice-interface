@@ -133,6 +133,13 @@ W-PR-01	Шумная или реверберирующая команда (сл�
 | `transcription_app_vosk.py` | Vosk (стриминговый) |
 | `transcription_app_whisper.py` | Whisper-small (faster-whisper) для команд + Vosk для wake word |
 
+Android-версии (см. подпапки `android/` и `android_whisper/`):
+
+| Папка | Движок распознавания |
+|---|---|
+| `android/` | Vosk (Android, стриминговый) |
+| `android_whisper/` | Whisper-tiny (whisper.cpp, батч + VAD) |
+
 ### 🔧 Зависимости
 
 Ставятся вручную (в репозиторий не входят):
@@ -178,14 +185,46 @@ pip install bleak pyserial
 
 > ⚠️ Через BLE команды уходят в характеристику `4368000a` (MOVE_ALL_FINGERS) протеза Fest; через serial — в регистр `0xBB`. Для работы нужен протез Fest.
 
-### ⚡ Замеры (средняя задержка и попытки распознавания)
+### ⚡ Замеры (средняя задержка и выполнимость)
 
-| Движок / модель | Средняя задержка | Среднее число попыток |
+| Движок / модель | Средняя задержка | Средняя выполнимость |
 |---|---|---|
-| Vosk-small (Python) | 1901 мс | 1–2 |
-| Whisper-tiny (Python) | 1041 мс | 3–4 |
-| Whisper-base (Python) | 2044 мс | 1–2 |
-| Whisper-small (Python) | 5791 мс | 1–2 |
-| Vosk-small (Android) | 1169 мс | 1 |
+| Vosk-small (Python) | 1689.3 мс | 62.5% |
+| Whisper-tiny (Python) | 836.4 мс | 59.9% |
+| Whisper-base (Python) | 1826.7 мс | 76% |
+| Whisper-small (Python) | 5964 мс | 84.2% |
+| Vosk-small (Android) | 1855 мс | 69.9% |
 
-> Замеры end-to-end на CPU: от захвата команды до выполнения жеста. Число попыток — сколько раз нужно повторить команду, чтобы она распозналась.
+> Замеры end-to-end на CPU: от захвата команды до выполнения жеста. Средняя выполнимость — доля команд, распознанных корректно (для samples/negative/malformed считается «выполнено», если команда не распозналась).
+
+---
+
+## 🤖 Whisper на Android (`android_whisper/`)
+
+Тот же Android-стенд «ГолосЖест», но распознавание — **whisper.cpp (Whisper-tiny, квантизированный `ggml-tiny-q5_1.bin`)** вместо Vosk. Интерфейс, BLE-управление протезом (характеристика `4368000a`) и кнопки — как в `android/`.
+
+- **Сборка**: требуется NDK + CMake (см. `android_whisper/README.md`). CMake собирает `libwhisper.so` из исходников whisper.cpp (`app/src/main/jni/whisper.cpp/`, в git не входит — клонируется отдельно).
+- **Распознавание**: AudioRecord + RMS-VAD захватывает фразу, whisper.cpp транскрибирует её целиком (язык `ru`); команда выполняется, если в тексте есть «протез» + жест.
+
+### «Run samples» — прогон сэмплов на устройстве
+
+Кнопка «Run samples» обрабатывает аудио из папки приложения и сверяет с `manifest.json`. Нужно положить файлы на устройство:
+
+```
+/storage/emulated/0/Android/data/com.ccmnp.voskbench/files/samples/
+├── manifest.json
+├── clean/commands/
+├── clean/edge/
+├── clean/status/
+├── negative/malformed/
+└── noisy/{machinery,office,reverb,street}/
+```
+
+Скопировать можно через **Device Explorer** в Android Studio (View → Tool Windows → Device Explorer, правый клик по `files` → Upload) или через ADB:
+
+```bash
+adb push samples /storage/emulated/0/Android/data/com.ccmnp.voskbench/files/
+adb push manifest.json /storage/emulated/0/Android/data/com.ccmnp.voskbench/files/samples/
+```
+
+После нажатия «Run samples» в `files/samples/` создаётся **`Results_Whisper.txt`** с таблицами по папкам и общим итогом (средняя выполнимость и средняя задержка). Для `negative/malformed` считается «выполнено», если fuzzy match ниже порога (команда корректно не выполнилась).
